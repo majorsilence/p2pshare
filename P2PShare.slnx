@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/P2PShare.Core/P2PShare.Core.csproj" />
+    <Project Path="src/P2PShare.Desktop/P2PShare.Desktop.csproj" />
+  </Folder>
+</Solution>
