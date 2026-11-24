@@ -55,6 +55,17 @@ public class ServiceTests
     }
 
     [Fact]
+    public async Task Offline_mode_never_asks_the_router_for_a_port_mapping()
+    {
+        using var dir = new TempDir();
+        await using var service = NewService(OfflineSettings(dir));
+
+        await service.StartAsync();
+
+        Assert.Null(service.PortMapper);
+    }
+
+    [Fact]
     public async Task Adding_the_same_download_twice_keeps_one_transfer_and_one_saved_entry()
     {
         using var dir = new TempDir();

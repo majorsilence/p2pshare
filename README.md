@@ -44,6 +44,20 @@ session, and the "already tried" bookkeeping is size-capped so a long-running cr
 stays flat. Torrent names come from strangers, so they're stripped of control and
 bidirectional-override characters and length-capped before being stored or shown.
 
+### Trackers
+
+Downloads and the torrents you share also use BitTorrent trackers, as a speed-up on top of the DHT.
+Six long-running public ones are built in (each answered a UDP handshake when the list was put
+together). Edit the list on the Settings tab: one `udp://`, `http://` or `https://` URL per line, `#`
+for comments, empty for DHT only. Edits apply to the next download, share or lookup. Trackers are
+added to magnet links and to `.torrent` downloads (never to private torrents) and are written into
+the `.torrent` file of anything you share.
+
+By default a few of them (never more than four, chosen at random) are also asked for peers when a
+search lookup needs a torrent's metadata, which finds more of them than the DHT alone. A lookup
+contacts the tracker by itself, so the tracker sees your address for torrents you never chose to
+download; untick the option on the Settings tab if you would rather not.
+
 ## Project layout
 
 ```
@@ -53,6 +67,8 @@ src/
     Dht/NodeId.cs             160-bit DHT node/info-hash type
     Engine/TorrentEngine.cs   MonoTorrent wrapper: metadata fetch, download, seed, torrent creation
     Engine/DownloadSource.cs  Parses what the user typed/picked: magnet, bare info-hash, or .torrent path
+    Net/PortMapper.cs         Asks the router (UPnP / NAT-PMP) to forward the crawler's UDP port
+    Net/TrackerList.cs        Built-in, user-editable list of tracker announce URLs
     Search/SearchIndex.cs     SQLite + FTS5 local search index (thread-safe)
     Settings/AppSettings.cs   JSON-persisted settings, saved atomically; remembers downloads and shares
     Util/ExpiringSet.cs       Size-capped, time-limited "seen recently" set
@@ -109,8 +125,12 @@ PNG; set `P2PSHARE_UI_SNAPSHOTS` to a folder to keep those images.
 - **Shares are re-hashed at every start.** A resumed share rebuilds its `.torrent` from the files;
   large libraries should reuse the cached one when sizes and timestamps still match.
 - **Search covers torrent names only**, not the file names inside a torrent.
-- **The crawler's port isn't forwarded.** Behind a NAT it mostly sees replies to its own queries, not
-  unsolicited ones, so it will index far less than on a machine with the port reachable.
+- **The crawler's port has to be reachable.** At start-up the app asks the router to forward it (UPnP
+  and NAT-PMP) and takes the mapping out again on exit; the Network tab's log says what happened. That
+  cannot help when the router itself sits behind another NAT (an ISP modem) or the ISP shares one
+  address between customers - the log says so - and then the index fills much more slowly, because
+  most queries from other nodes never arrive. Forward the UDP port on every device in the chain by
+  hand, or put the ISP modem in bridge mode.
 - **The UI was verified headlessly**, not by clicking through a real Avalonia window.
 
 ## Other platforms ("progressive desktop/mobile")

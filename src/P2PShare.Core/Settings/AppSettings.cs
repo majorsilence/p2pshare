@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using P2PShare.Core.Net;
 
 namespace P2PShare.Core.Settings;
 
@@ -29,6 +30,15 @@ public sealed class AppSettings
     public string Theme { get; set; } = "Y2K Green";
     public List<string> SharedPaths { get; set; } = new();
     public List<SavedDownload> Downloads { get; set; } = new();
+
+    /// <summary>
+    /// Announce URLs added to downloads and to torrents this app creates. Starts as the built-in
+    /// list; the user can edit it, and an empty list means "DHT only".
+    /// </summary>
+    public List<string> Trackers { get; set; } = TrackerList.Defaults.ToList();
+
+    /// <summary>Also let the background search lookups ask a few of the trackers for peers.</summary>
+    public bool UseTrackersForLookups { get; set; } = true;
 
     /// <summary>
     /// Held while the lists above are mutated or serialized, so a background thread adding a
@@ -66,6 +76,12 @@ public sealed class AppSettings
                     loaded.AppDataDirectory = appDataDirectory;
                     loaded.SharedPaths ??= new();
                     loaded.Downloads ??= new();
+                    // A settings.json from an older version has no list at all (the built-in one
+                    // applies), whereas an empty list is a deliberate "no trackers". Hand edits are
+                    // cleaned up the same way the Settings tab cleans them.
+                    loaded.Trackers = loaded.Trackers is null
+                        ? TrackerList.Defaults.ToList()
+                        : TrackerList.Parse(string.Join("\n", loaded.Trackers)).Valid.ToList();
                     return loaded;
                 }
             }

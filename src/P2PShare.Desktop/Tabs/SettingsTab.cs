@@ -1,5 +1,7 @@
 using Majorsilence.Forms;
+using Majorsilence.Forms.Drawing;
 using P2PShare.Core;
+using P2PShare.Core.Net;
 
 namespace P2PShare.Desktop.Tabs;
 
@@ -12,6 +14,8 @@ public sealed class SettingsTab : UserControl
     private readonly NumericUpDown _listenPort;
     private readonly NumericUpDown _dhtPort;
     private readonly NumericUpDown _crawlerPort;
+    private readonly TextBox _trackers;
+    private readonly CheckBox _trackersForLookups;
 
     public SettingsTab(P2PShareService service)
     {
@@ -50,14 +54,47 @@ public sealed class SettingsTab : UserControl
         portsGroup.Controls.Add(crawlerLabel);
         portsGroup.Controls.Add(_crawlerPort);
 
-        var hint = new Label { Left = 12, Top = 292, Width = 700, Height = 20, Text = "Port and bandwidth changes take effect the next time P2PShare starts." };
+        var trackersGroup = new GroupBox { Left = 12, Top = 292, Width = 700, Height = 205, Text = "Trackers" };
+        var trackersHelp = new Label
+        {
+            Left = 12, Top = 22, Width = 676, Height = 18,
+            Text = "One announce URL per line (udp://, http:// or https://). Lines starting with # are ignored. Empty = DHT only.",
+        };
+        string trackerText;
+        lock (service.Settings.SyncRoot) trackerText = TrackerList.ToText(service.Settings.Trackers);
+        _trackers = new TextBox
+        {
+            Left = 12, Top = 44, Width = 676, Height = 108,
+            Multiline = true,
+            Font = new Font("Consolas", 9f, bold: false, italic: false),
+            Text = trackerText,
+        };
+        _trackersForLookups = new CheckBox
+        {
+            Left = 12, Top = 164, Width = 520, Height = 24,
+            Text = "Also ask a few trackers for peers when looking up search results",
+            Checked = service.Settings.UseTrackersForLookups,
+        };
+        var resetTrackers = new Button { Left = 560, Top = 162, Width = 128, Height = 26, Text = "Reset to defaults" };
+        resetTrackers.Click += (_, _) => _trackers.Text = TrackerList.ToText(TrackerList.Defaults);
+        trackersGroup.Controls.Add(trackersHelp);
+        trackersGroup.Controls.Add(_trackers);
+        trackersGroup.Controls.Add(_trackersForLookups);
+        trackersGroup.Controls.Add(resetTrackers);
 
-        var save = new Button { Left = 12, Top = 320, Width = 120, Height = 30, Text = "Save Settings" };
+        var hint = new Label
+        {
+            Left = 12, Top = 507, Width = 700, Height = 20,
+            Text = "Ports and bandwidth apply on the next start. Tracker edits apply to anything added afterwards.",
+        };
+
+        var save = new Button { Left = 12, Top = 535, Width = 120, Height = 30, Text = "Save Settings" };
         save.Click += (_, _) => Save();
 
         Controls.Add(downloadsGroup);
         Controls.Add(bandwidthGroup);
         Controls.Add(portsGroup);
+        Controls.Add(trackersGroup);
         Controls.Add(hint);
         Controls.Add(save);
     }
@@ -78,6 +115,22 @@ public sealed class SettingsTab : UserControl
 
     private void Save()
     {
+        // Check the tracker list first, so a typo is pointed out instead of silently dropped.
+        var trackers = TrackerList.Parse(_trackers.Text);
+        if (trackers.Rejected.Count > 0)
+        {
+            var shown = string.Join(Environment.NewLine, trackers.Rejected.Take(5).Select(r => $"  {r.Line}  ({r.Reason})"));
+            var more = trackers.Rejected.Count > 5 ? $"{Environment.NewLine}  ...and {trackers.Rejected.Count - 5} more" : "";
+            MessageBox.Show($"These tracker lines can't be used, so nothing was saved:{Environment.NewLine}{shown}{more}", "P2PShare");
+            return;
+        }
+
+        lock (_service.Settings.SyncRoot)
+        {
+            _service.Settings.Trackers = trackers.Valid.ToList();
+            _service.Settings.UseTrackersForLookups = _trackersForLookups.Checked;
+        }
+
         _service.Settings.DownloadsDirectory = _downloadsPath.Text;
         _service.Settings.MaxDownloadKBps = (int)_maxDownload.Value;
         _service.Settings.MaxUploadKBps = (int)_maxUpload.Value;

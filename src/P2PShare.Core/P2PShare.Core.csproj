@@ -9,6 +9,12 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="11.0.0" />
     <PackageReference Include="MonoTorrent" Version="3.0.2" />
+    <!-- Already pulled in by MonoTorrent; referenced directly because PortMapper uses it. -->
+    <PackageReference Include="Mono.Nat" Version="3.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="P2PShare.Core.Tests" />
   </ItemGroup>
 
 </Project>

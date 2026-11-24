@@ -1,6 +1,8 @@
 using System.Net;
 using MonoTorrent;
+using MonoTorrent.BEncoding;
 using MonoTorrent.Client;
+using P2PShare.Core.Net;
 
 namespace P2PShare.Core.Engine;
 
@@ -79,13 +81,17 @@ public sealed class TorrentEngine : IAsyncDisposable
     /// Many info-hashes seen circulating on the DHT will have few or no reachable peers by the
     /// time we look - that failure is expected and simply means nothing useful to index.
     /// </summary>
-    public async Task<FetchedMetadata?> TryFetchMetadataAsync(string infoHashHex, TimeSpan timeout, CancellationToken token)
+    public async Task<FetchedMetadata?> TryFetchMetadataAsync(
+        string infoHashHex, TimeSpan timeout, CancellationToken token, IReadOnlyList<string>? trackers = null)
     {
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
         cts.CancelAfter(timeout);
         try
         {
-            var magnet = new MagnetLink(InfoHash.FromHex(infoHashHex));
+            // Trackers, where given, are one more place to find peers for a hash the DHT alone
+            // often can't.
+            var magnet = new MagnetLink(
+                InfoHash.FromHex(infoHashHex), null, trackers is { Count: > 0 } ? trackers.ToList() : null, null, null);
             var metadata = await _engine.DownloadMetadataAsync(magnet, cts.Token).ConfigureAwait(false);
             var torrent = Torrent.Load(metadata.Span);
             var files = torrent.Files.Select(f => (f.Path, f.Length)).ToList();
@@ -106,9 +112,10 @@ public sealed class TorrentEngine : IAsyncDisposable
     /// the existing transfer is returned.
     /// </summary>
     /// <exception cref="FormatException">The text is not a valid magnet URI.</exception>
-    public async Task<TransferSnapshot> AddMagnetAsync(string magnetUri, string? saveDirectory = null)
+    public async Task<TransferSnapshot> AddMagnetAsync(
+        string magnetUri, string? saveDirectory = null, IReadOnlyList<string>? trackers = null)
     {
-        var magnet = MagnetLink.Parse(magnetUri);
+        var magnet = WithTrackers(MagnetLink.Parse(magnetUri), trackers);
         var existing = Find(magnet.InfoHashes.V1OrV2.ToHex());
         if (existing is not null) return ToSnapshot(existing);
 
@@ -118,23 +125,32 @@ public sealed class TorrentEngine : IAsyncDisposable
     }
 
     /// <summary>Starts downloading from a .torrent file on disk. Already-added torrents return the existing transfer.</summary>
-    public async Task<TransferSnapshot> AddTorrentFileAsync(string torrentPath, string? saveDirectory = null)
+    public async Task<TransferSnapshot> AddTorrentFileAsync(
+        string torrentPath, string? saveDirectory = null, IReadOnlyList<string>? trackers = null)
     {
         var torrent = await Torrent.LoadAsync(torrentPath).ConfigureAwait(false);
         var existing = Find(torrent.InfoHashes.V1OrV2.ToHex());
         if (existing is not null) return ToSnapshot(existing);
 
         var manager = await _engine.AddAsync(torrent, saveDirectory ?? DownloadsDirectory).ConfigureAwait(false);
+
+        // A private torrent's own tracker is the only one its swarm wants; leave those alone.
+        if (!torrent.IsPrivate) await AddExtraTrackersAsync(manager, torrent, trackers).ConfigureAwait(false);
         await manager.StartAsync().ConfigureAwait(false);
         return ToSnapshot(manager);
     }
 
     /// <summary>Creates a .torrent from an existing local file or folder and starts seeding it.</summary>
-    public async Task<TransferSnapshot> ShareAsync(string sourcePath, string torrentOutputDirectory)
+    public async Task<TransferSnapshot> ShareAsync(
+        string sourcePath, string torrentOutputDirectory, IReadOnlyList<string>? trackers = null)
     {
         var fileSource = new TorrentFileSource(sourcePath);
         var creator = new TorrentCreator(TorrentType.V1Only) { StoreMD5 = false, StoreSHA1 = true };
         var dictionary = await creator.CreateAsync(fileSource).ConfigureAwait(false);
+
+        // Embedded in the .torrent so that anyone who gets the file can find us through the
+        // trackers as well as the DHT. The info-hash does not depend on them.
+        ApplyTrackers(dictionary, trackers);
         var torrent = Torrent.Load(dictionary);
 
         // Sharing the same thing twice would make the engine throw a duplicate-torrent error.
@@ -150,6 +166,44 @@ public sealed class TorrentEngine : IAsyncDisposable
         lock (_seedOnlyInfoHashes) _seedOnlyInfoHashes.Add(manager.InfoHashes.V1OrV2.ToHex());
         await manager.StartAsync().ConfigureAwait(false);
         return ToSnapshot(manager);
+    }
+
+    /// <summary>The announce URLs a transfer will use, for tests and diagnostics.</summary>
+    internal IReadOnlyList<string> GetTrackerUrls(string infoHashHex) =>
+        Find(infoHashHex)?.TrackerManager.Tiers.SelectMany(tier => tier.Trackers).Select(t => t.Uri.ToString()).ToList()
+        ?? new List<string>();
+
+    private static MagnetLink WithTrackers(MagnetLink magnet, IReadOnlyList<string>? trackers)
+    {
+        if (trackers is null || trackers.Count == 0) return magnet;
+
+        var merged = TrackerList.Merge(magnet.AnnounceUrls, trackers); // the link's own trackers keep priority
+        if (merged.Count == magnet.AnnounceUrls.Count) return magnet;
+        return new MagnetLink(magnet.InfoHashes, magnet.Name, merged, magnet.Webseeds, magnet.Size);
+    }
+
+    private static async Task AddExtraTrackersAsync(TorrentManager manager, Torrent torrent, IReadOnlyList<string>? trackers)
+    {
+        if (trackers is null || trackers.Count == 0) return;
+
+        var known = new HashSet<string>(torrent.AnnounceUrls.SelectMany(tier => tier), StringComparer.OrdinalIgnoreCase);
+        foreach (var url in trackers)
+        {
+            if (known.Contains(url) || !Uri.TryCreate(url, UriKind.Absolute, out var uri)) continue;
+            try { await manager.TrackerManager.AddTrackerAsync(uri).ConfigureAwait(false); }
+            catch (Exception) { /* a tracker MonoTorrent can't use isn't worth failing the download for */ }
+        }
+    }
+
+    private static void ApplyTrackers(BEncodedDictionary dictionary, IReadOnlyList<string>? trackers)
+    {
+        if (trackers is null || trackers.Count == 0) return;
+
+        // One tier per tracker, so a client announces to all of them rather than only the first that answers.
+        var tiers = new BEncodedList();
+        foreach (var url in trackers) tiers.Add(new BEncodedList { new BEncodedString(url) });
+        dictionary["announce"] = new BEncodedString(trackers[0]);
+        dictionary["announce-list"] = tiers;
     }
 
     public IReadOnlyList<TransferSnapshot> GetSnapshots() => _engine.Torrents.Select(ToSnapshot).ToList();

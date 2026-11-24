@@ -29,6 +29,8 @@ public sealed class DhtCrawler : IAsyncDisposable
         ("router.bittorrent.com", 6881),
         ("dht.transmissionbt.com", 6881),
         ("router.utorrent.com", 6881),
+        ("dht.libtorrent.org", 25401),
+        ("dht.aelitis.com", 6881),
     };
 
     private const int MaxRoutingTableSize = 1000;

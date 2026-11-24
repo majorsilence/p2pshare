@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Threading.Channels;
 using P2PShare.Core.Dht;
 using P2PShare.Core.Engine;
+using P2PShare.Core.Net;
 using P2PShare.Core.Search;
 using P2PShare.Core.Settings;
 using P2PShare.Core.Util;
@@ -39,6 +40,8 @@ public sealed class P2PShareService : IAsyncDisposable
     private readonly ConcurrentDictionary<string, int> _pendingSightings = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly List<Task> _workers = new();
+    private readonly bool _enableNetwork;
+    private PortMapper? _portMapper;
     private CancellationTokenSource? _cts;
     private long _lookupsAttempted;
     private long _lookupsResolved;
@@ -47,6 +50,9 @@ public sealed class P2PShareService : IAsyncDisposable
     public DhtCrawler Crawler { get; }
     public TorrentEngine Engine { get; }
     public SearchIndex Index { get; }
+
+    /// <summary>Null until the crawler has started, and always null in offline (test) mode.</summary>
+    internal PortMapper? PortMapper => _portMapper;
 
     /// <summary>Metadata lookups started, resolved, and currently waiting - shown on the Network tab.</summary>
     public long LookupsAttempted => Interlocked.Read(ref _lookupsAttempted);
@@ -102,6 +108,7 @@ public sealed class P2PShareService : IAsyncDisposable
     public P2PShareService(AppSettings settings, bool enableNetwork = true)
     {
         Settings = settings;
+        _enableNetwork = enableNetwork;
         Directory.CreateDirectory(settings.AppDataDirectory);
 
         Engine = new TorrentEngine(new EngineOptions(
@@ -119,6 +126,18 @@ public sealed class P2PShareService : IAsyncDisposable
         Crawler = new DhtCrawler(enableNetwork ? null : Array.Empty<(string, int)>());
         Crawler.InfoHashObserved += OnInfoHashObserved;
         Crawler.Log += Log;
+    }
+
+    /// <summary>The tracker list as it is right now, so edits in Settings apply to the next download without a restart.</summary>
+    private string[] TrackersSnapshot()
+    {
+        lock (Settings.SyncRoot) return Settings.Trackers.ToArray();
+    }
+
+    private IReadOnlyList<string> LookupTrackers()
+    {
+        lock (Settings.SyncRoot)
+            return Settings.UseTrackersForLookups ? TrackerList.PickForLookup(Settings.Trackers.ToArray()) : Array.Empty<string>();
     }
 
     private string TorrentsDirectory => Path.Combine(Settings.AppDataDirectory, "torrents");
@@ -141,6 +160,15 @@ public sealed class P2PShareService : IAsyncDisposable
         {
             await Crawler.StartAsync(Settings.CrawlerPort, token).ConfigureAwait(false);
             Log($"DHT crawler listening on UDP {Crawler.LocalPort}");
+
+            // Without a forwarded port, a home router drops most of the queries other nodes send
+            // the crawler, and those queries are the search index's only source. Never in offline
+            // (test) mode, which must not touch the real router.
+            if (_enableNetwork)
+            {
+                _portMapper = new PortMapper(Crawler.LocalPort, Log);
+                _portMapper.Start();
+            }
         }
         catch (Exception ex)
         {
@@ -162,7 +190,7 @@ public sealed class P2PShareService : IAsyncDisposable
         {
             try
             {
-                await Engine.ShareAsync(path, TorrentsDirectory).ConfigureAwait(false);
+                await Engine.ShareAsync(path, TorrentsDirectory, TrackersSnapshot()).ConfigureAwait(false);
                 Log($"Resumed seeding: {path}");
             }
             catch (Exception ex)
@@ -195,7 +223,7 @@ public sealed class P2PShareService : IAsyncDisposable
     {
         try
         {
-            await Engine.ShareAsync(path, TorrentsDirectory).ConfigureAwait(false);
+            await Engine.ShareAsync(path, TorrentsDirectory, TrackersSnapshot()).ConfigureAwait(false);
             lock (Settings.SyncRoot)
             {
                 if (!Settings.SharedPaths.Contains(path, StringComparer.OrdinalIgnoreCase))
@@ -246,8 +274,8 @@ public sealed class P2PShareService : IAsyncDisposable
 
     private Task<TransferSnapshot> AddToEngineAsync(DownloadSource source) => source.Kind switch
     {
-        DownloadSourceKind.TorrentFile => Engine.AddTorrentFileAsync(source.Value),
-        _ => Engine.AddMagnetAsync(source.Value),
+        DownloadSourceKind.TorrentFile => Engine.AddTorrentFileAsync(source.Value, null, TrackersSnapshot()),
+        _ => Engine.AddMagnetAsync(source.Value, null, TrackersSnapshot()),
     };
 
     /// <summary>
@@ -348,7 +376,7 @@ public sealed class P2PShareService : IAsyncDisposable
     private async Task ResolveOneAsync(string hex, CancellationToken token)
     {
         Interlocked.Increment(ref _lookupsAttempted);
-        var metadata = await Engine.TryFetchMetadataAsync(hex, MetadataTimeout, token).ConfigureAwait(false);
+        var metadata = await Engine.TryFetchMetadataAsync(hex, MetadataTimeout, token, LookupTrackers()).ConfigureAwait(false);
         if (metadata is null) return;
 
         var result = Index.UpsertResolved(metadata);
@@ -374,6 +402,12 @@ public sealed class P2PShareService : IAsyncDisposable
         // must always be closed, and the workers' final popularity flush must run before that.
         try { _cts?.Cancel(); } catch (ObjectDisposedException) { }
         _resolutionQueue.Writer.TryComplete();
+
+        if (_portMapper is not null)
+        {
+            try { await _portMapper.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception ex) { Log($"Port mapping did not shut down cleanly: {ex.Message}"); }
+        }
 
         try { await Crawler.StopAsync().ConfigureAwait(false); }
         catch (Exception ex) { Log($"Crawler did not stop cleanly: {ex.Message}"); }
