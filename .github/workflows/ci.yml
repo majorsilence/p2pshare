@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # The engine library and its tests are plain .NET and run everywhere. The tests are fully
+  # offline: they talk to a crawler over loopback UDP and never touch the public DHT.
+  core:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Test engine library
+        run: dotnet test tests/P2PShare.Core.Tests --configuration Release
+
+  # UI smoke tests render the real forms on Majorsilence.Forms' offscreen backend. Only run on
+  # Windows for now, which is where they were developed.
+  desktop:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Build everything
+        run: dotnet build --configuration Release
+      - name: UI smoke tests
+        run: dotnet test tests/P2PShare.Desktop.Tests --configuration Release --no-build

@@ -21,14 +21,17 @@ public sealed class LibraryTab : UserControl
         addFolder.Click += (_, _) => ShareFolder();
         var addFile = new Button { Left = 158, Top = 8, Width = 120, Height = 28, Text = "Share File..." };
         addFile.Click += (_, _) => ShareFile();
+        var stopSharing = new Button { Left = 286, Top = 8, Width = 130, Height = 28, Text = "Stop Sharing" };
+        stopSharing.Click += (_, _) => StopSharingSelected();
         topPanel.Controls.Add(addFolder);
         topPanel.Controls.Add(addFile);
+        topPanel.Controls.Add(stopSharing);
 
         var hint = new Label
         {
             Dock = DockStyle.Bottom,
             Height = 24,
-            Text = "Shared items are seeded over BitTorrent and announced on the DHT so other peers can find them.",
+            Text = "Shared items are seeded over BitTorrent and announced on the DHT so other peers can find them. Stopping never deletes your files.",
         };
 
         _list = new ListView
@@ -74,27 +77,38 @@ public sealed class LibraryTab : UserControl
     private async Task ShareAndReport(string path)
     {
         var ok = await _service.AddSharedPathAsync(path);
-        if (!ok) MessageBox.Show($"Couldn't start sharing:\n{path}", "Share");
+        if (!ok) MessageBox.Show($"Couldn't start sharing:\n{path}\n\nSee the Network tab's activity log for details.", "Share");
         RefreshList();
+    }
+
+    private async void StopSharingSelected()
+    {
+        if (_list.SelectedItem?.Tag is not TransferSnapshot snapshot) return;
+
+        try
+        {
+            await _service.RemoveTransferAsync(snapshot.InfoHashHex);
+            RefreshList();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Couldn't stop sharing:\n{ex.Message}", "Share");
+        }
     }
 
     private void RefreshList()
     {
-        var shared = new HashSet<string>(_service.Settings.SharedPaths, StringComparer.OrdinalIgnoreCase);
-        var snapshots = _service.Engine.GetSnapshots().Where(s => s.IsSeedOnly).ToList();
+        var seeds = _service.Engine.GetSnapshots().Where(s => s.IsSeedOnly).ToList();
 
-        _list.BeginUpdate();
-        _list.Items.Clear();
-        foreach (var s in snapshots)
+        _list.Repopulate(seeds, s => s.InfoHashHex, s =>
         {
-            var item = new ListViewItem(s.Name) { Tag = s };
-            item.SubItems.Add(s.State.ToString());
-            item.SubItems.Add($"{P2PShareService.FormatSize(s.UploadRateBps)}/s");
-            item.SubItems.Add(s.AvailablePeers.ToString());
-            item.SubItems.Add(P2PShareService.FormatSize(s.TotalSize));
-            item.SubItems.Add(s.SavePath);
-            _list.Items.Add(item);
-        }
-        _list.EndUpdate();
+            var row = new ListViewItem(s.Name);
+            row.SubItems.Add(s.State.ToString());
+            row.SubItems.Add($"{P2PShareService.FormatSize(s.UploadRateBps)}/s");
+            row.SubItems.Add(s.AvailablePeers.ToString());
+            row.SubItems.Add(P2PShareService.FormatSize(s.TotalSize));
+            row.SubItems.Add(s.SavePath);
+            return row;
+        });
     }
 }

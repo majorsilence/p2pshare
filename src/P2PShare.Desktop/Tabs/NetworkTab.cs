@@ -7,12 +7,19 @@ namespace P2PShare.Desktop.Tabs;
 
 public sealed class NetworkTab : UserControl
 {
+    // The log is a plain text box; without a cap a long-running crawler would grow it forever.
+    private const int MaxLogLines = 500;
+    private const int MaxPendingLogLines = 2000;
+
+    private readonly System.Collections.Concurrent.ConcurrentQueue<string> _pendingLog = new();
     private readonly P2PShareService _service;
     private readonly Label _crawlerNodesLabel;
     private readonly Label _queriesLabel;
     private readonly Label _uniqueHashesLabel;
+    private readonly Label _lookupsLabel;
     private readonly Label _engineDhtLabel;
     private readonly TextBox _log;
+    private readonly Queue<string> _logLines = new();
     private readonly Timer _refreshTimer;
 
     public NetworkTab(P2PShareService service)
@@ -20,7 +27,7 @@ public sealed class NetworkTab : UserControl
         _service = service;
         BackColor = Theme.PanelBackground;
 
-        var statsPanel = new Panel { Dock = DockStyle.Top, Height = 150 };
+        var statsPanel = new Panel { Dock = DockStyle.Top, Height = 176 };
 
         var explanation = new Label
         {
@@ -35,12 +42,14 @@ public sealed class NetworkTab : UserControl
         _crawlerNodesLabel = MakeStatLabel("Crawler DHT nodes known: 0", 10, 48);
         _queriesLabel = MakeStatLabel("DHT queries observed: 0", 10, 72);
         _uniqueHashesLabel = MakeStatLabel("Unique info-hashes observed: 0", 10, 96);
-        _engineDhtLabel = MakeStatLabel("Download engine DHT: starting...", 10, 120);
+        _lookupsLabel = MakeStatLabel("Metadata lookups: 0 tried, 0 resolved, 0 waiting", 10, 120);
+        _engineDhtLabel = MakeStatLabel("Download engine DHT: starting...", 10, 144);
 
         statsPanel.Controls.Add(explanation);
         statsPanel.Controls.Add(_crawlerNodesLabel);
         statsPanel.Controls.Add(_queriesLabel);
         statsPanel.Controls.Add(_uniqueHashesLabel);
+        statsPanel.Controls.Add(_lookupsLabel);
         statsPanel.Controls.Add(_engineDhtLabel);
 
         var logLabel = new Label { Dock = DockStyle.Bottom, Height = 20, Text = "Activity log:" };
@@ -59,7 +68,8 @@ public sealed class NetworkTab : UserControl
         Controls.Add(logLabel);
         Controls.Add(statsPanel);
 
-        _service.ActivityLog += OnActivityLog;
+        // Replays what was logged before this tab existed (e.g. startup problems), then follows live.
+        _service.SubscribeToActivity(OnActivity);
 
         _refreshTimer = new Timer { Interval = 1000 };
         _refreshTimer.Tick += (_, _) => RefreshStats();
@@ -69,19 +79,45 @@ public sealed class NetworkTab : UserControl
     private static Label MakeStatLabel(string text, int left, int top) =>
         new() { Left = left, Top = top, Width = 500, Text = text };
 
-    private void OnActivityLog(string message)
+    // Entries arrive on background threads, and some (the replayed history) before this control's
+    // window exists, so they are only queued here. The refresh timer, which runs on the UI thread,
+    // moves them into the text box. That keeps control access single-threaded without depending on
+    // being able to post to a window that may not be created yet.
+    private void OnActivity(ActivityEntry entry)
     {
-        BeginInvoke(() =>
+        _pendingLog.Enqueue($"[{entry.TimeLocal:HH:mm:ss}] {entry.Message}");
+        while (_pendingLog.Count > MaxPendingLogLines && _pendingLog.TryDequeue(out _)) { }
+    }
+
+    /// <summary>Moves queued activity into the log box. Called by the refresh timer on the UI thread.</summary>
+    internal void FlushLog()
+    {
+        while (_pendingLog.TryDequeue(out var line)) AppendLogLine(line);
+    }
+
+    private void AppendLogLine(string line)
+    {
+        _logLines.Enqueue(line);
+        if (_logLines.Count > MaxLogLines)
         {
-            _log.AppendText($"[{DateTime.Now:HH:mm:ss}] {message}{Environment.NewLine}");
-        });
+            while (_logLines.Count > MaxLogLines * 3 / 4) _logLines.Dequeue();
+            _log.Text = string.Join(Environment.NewLine, _logLines) + Environment.NewLine;
+        }
+        else
+        {
+            _log.AppendText(line + Environment.NewLine);
+        }
     }
 
     private void RefreshStats()
     {
-        _crawlerNodesLabel.Text = $"Crawler DHT nodes known: {_service.Crawler.NodeCount}";
+        FlushLog();
+        _crawlerNodesLabel.Text = _service.Crawler.IsRunning
+            ? $"Crawler DHT nodes known: {_service.Crawler.NodeCount}"
+            : "Crawler: not running (see the activity log below)";
         _queriesLabel.Text = $"DHT queries observed: {_service.Crawler.QueriesObserved}";
         _uniqueHashesLabel.Text = $"Unique info-hashes observed: {_service.Crawler.UniqueInfoHashesObserved}";
+        _lookupsLabel.Text = $"Metadata lookups: {_service.LookupsAttempted} tried, {_service.LookupsResolved} resolved, {_service.LookupsQueued} waiting";
         _engineDhtLabel.Text = $"Download engine DHT: {_service.Engine.Dht.State}, {_service.Engine.Dht.NodeCount} node(s)";
     }
 }

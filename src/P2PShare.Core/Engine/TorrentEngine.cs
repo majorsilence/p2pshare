@@ -10,7 +10,10 @@ public sealed record EngineOptions(
     int ListenPort,
     int DhtPort,
     int MaximumDownloadRateBytesPerSecond,
-    int MaximumUploadRateBytesPerSecond);
+    int MaximumUploadRateBytesPerSecond,
+    // Turn off DHT, UPnP/NAT-PMP and LAN peer discovery. Only meant for tests, which must not
+    // reach out to the real network; leave true for the real app.
+    bool EnableNetworkDiscovery = true);
 
 public sealed record FetchedMetadata(string InfoHashHex, string Name, long TotalSize, IReadOnlyList<(string Path, long Length)> Files);
 
@@ -48,9 +51,9 @@ public sealed class TorrentEngine : IAsyncDisposable
             {
                 ["ipv4"] = new IPEndPoint(IPAddress.Any, options.ListenPort),
             },
-            DhtEndPoint = new IPEndPoint(IPAddress.Any, options.DhtPort),
-            AllowPortForwarding = true,
-            AllowLocalPeerDiscovery = true,
+            DhtEndPoint = options.EnableNetworkDiscovery ? new IPEndPoint(IPAddress.Any, options.DhtPort) : null,
+            AllowPortForwarding = options.EnableNetworkDiscovery,
+            AllowLocalPeerDiscovery = options.EnableNetworkDiscovery,
             AutoSaveLoadDhtCache = true,
             AutoSaveLoadFastResume = true,
             AutoSaveLoadMagnetLinkMetadata = true,
@@ -98,10 +101,30 @@ public sealed class TorrentEngine : IAsyncDisposable
         }
     }
 
-    public async Task<TransferSnapshot> StartDownloadAsync(string magnetUri, string? saveDirectory = null)
+    /// <summary>
+    /// Starts downloading a magnet link. Adding something already in the engine is not an error;
+    /// the existing transfer is returned.
+    /// </summary>
+    /// <exception cref="FormatException">The text is not a valid magnet URI.</exception>
+    public async Task<TransferSnapshot> AddMagnetAsync(string magnetUri, string? saveDirectory = null)
     {
         var magnet = MagnetLink.Parse(magnetUri);
+        var existing = Find(magnet.InfoHashes.V1OrV2.ToHex());
+        if (existing is not null) return ToSnapshot(existing);
+
         var manager = await _engine.AddAsync(magnet, saveDirectory ?? DownloadsDirectory).ConfigureAwait(false);
+        await manager.StartAsync().ConfigureAwait(false);
+        return ToSnapshot(manager);
+    }
+
+    /// <summary>Starts downloading from a .torrent file on disk. Already-added torrents return the existing transfer.</summary>
+    public async Task<TransferSnapshot> AddTorrentFileAsync(string torrentPath, string? saveDirectory = null)
+    {
+        var torrent = await Torrent.LoadAsync(torrentPath).ConfigureAwait(false);
+        var existing = Find(torrent.InfoHashes.V1OrV2.ToHex());
+        if (existing is not null) return ToSnapshot(existing);
+
+        var manager = await _engine.AddAsync(torrent, saveDirectory ?? DownloadsDirectory).ConfigureAwait(false);
         await manager.StartAsync().ConfigureAwait(false);
         return ToSnapshot(manager);
     }
@@ -113,6 +136,10 @@ public sealed class TorrentEngine : IAsyncDisposable
         var creator = new TorrentCreator(TorrentType.V1Only) { StoreMD5 = false, StoreSHA1 = true };
         var dictionary = await creator.CreateAsync(fileSource).ConfigureAwait(false);
         var torrent = Torrent.Load(dictionary);
+
+        // Sharing the same thing twice would make the engine throw a duplicate-torrent error.
+        var existing = Find(torrent.InfoHashes.V1OrV2.ToHex());
+        if (existing is not null) return ToSnapshot(existing);
 
         Directory.CreateDirectory(torrentOutputDirectory);
         var torrentPath = Path.Combine(torrentOutputDirectory, $"{torrent.Name}.torrent");
@@ -136,7 +163,15 @@ public sealed class TorrentEngine : IAsyncDisposable
     public async Task RemoveAsync(string infoHashHex)
     {
         var manager = Find(infoHashHex);
-        if (manager is not null) await _engine.RemoveAsync(manager).ConfigureAwait(false);
+        if (manager is null) return;
+
+        var hashHex = manager.InfoHashes.V1OrV2.ToHex();
+
+        // MonoTorrent refuses to unregister a manager that is still running.
+        if (manager.State != TorrentState.Stopped)
+            await manager.StopAsync().ConfigureAwait(false);
+        await _engine.RemoveAsync(manager).ConfigureAwait(false);
+        lock (_seedOnlyInfoHashes) _seedOnlyInfoHashes.Remove(hashHex);
     }
 
     public void SubscribeToStateChanges(Action callback)
@@ -173,7 +208,13 @@ public sealed class TorrentEngine : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        await _engine.StopAllAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
-        _engine.Dispose();
+        // MonoTorrent can throw from StopAllAsync (e.g. ObjectDisposedException) when a torrent is
+        // still starting or hashing - such as a share resumed at launch when the user closes the
+        // window straight away. We're shutting down regardless, so never let that escape.
+        try { await _engine.StopAllAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false); }
+        catch (Exception) { }
+
+        try { _engine.Dispose(); }
+        catch (Exception) { }
     }
 }

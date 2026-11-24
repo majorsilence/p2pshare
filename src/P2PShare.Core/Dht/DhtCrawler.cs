@@ -24,7 +24,7 @@ public sealed record InfoHashObservation(NodeId InfoHash, ObservationKind Kind, 
 /// </summary>
 public sealed class DhtCrawler : IAsyncDisposable
 {
-    private static readonly (string Host, int Port)[] BootstrapNodes =
+    private static readonly (string Host, int Port)[] PublicBootstrapNodes =
     {
         ("router.bittorrent.com", 6881),
         ("dht.transmissionbt.com", 6881),
@@ -34,6 +34,14 @@ public sealed class DhtCrawler : IAsyncDisposable
     private const int MaxRoutingTableSize = 1000;
     private const int ClosestNodesReturned = 8;
 
+    /// <summary>
+    /// Bound on the "recently seen" info-hash filter. The public DHT carries far more distinct
+    /// hashes than a desktop process should remember; the filter only exists so the unique counter
+    /// below doesn't double count a hash that several nodes ask us about in quick succession.
+    /// </summary>
+    private const int MaxRememberedInfoHashes = 200_000;
+
+    private readonly (string Host, int Port)[] _bootstrapNodes;
     private readonly NodeId _selfId = NodeId.Random();
     private readonly ConcurrentDictionary<string, RoutingEntry> _routingTable = new();
     private readonly ConcurrentDictionary<string, byte> _seenInfoHashes = new();
@@ -45,22 +53,49 @@ public sealed class DhtCrawler : IAsyncDisposable
     private Task? _maintenanceLoop;
     private byte[] _tokenSecret = RandomNumberGenerator.GetBytes(16);
     private byte[] _previousTokenSecret = RandomNumberGenerator.GetBytes(16);
+    private long _queriesObserved;
+    private long _uniqueInfoHashesObserved;
 
     public event Action<InfoHashObservation>? InfoHashObserved;
     public event Action<string>? Log;
 
     public int NodeCount => _routingTable.Count;
-    public long QueriesObserved { get; private set; }
-    public long UniqueInfoHashesObserved => _seenInfoHashes.Count;
+    public long QueriesObserved => Interlocked.Read(ref _queriesObserved);
+    public long UniqueInfoHashesObserved => Interlocked.Read(ref _uniqueInfoHashesObserved);
     public bool IsRunning { get; private set; }
 
+    /// <summary>The UDP port actually bound (differs from the requested one when 0 was asked for). 0 when stopped.</summary>
+    public int LocalPort => (_udp?.Client.LocalEndPoint as IPEndPoint)?.Port ?? 0;
+
     private sealed record RoutingEntry(NodeId Id, IPEndPoint EndPoint, DateTime LastSeenUtc);
+
+    /// <param name="bootstrapNodes">
+    /// Hosts to contact to join the network. Defaults to the well-known public routers; pass an
+    /// empty list to run isolated (used by tests, which must not touch the real network).
+    /// </param>
+    public DhtCrawler(IEnumerable<(string Host, int Port)>? bootstrapNodes = null)
+    {
+        _bootstrapNodes = bootstrapNodes?.ToArray() ?? PublicBootstrapNodes;
+    }
 
     public async Task StartAsync(int port, CancellationToken token)
     {
         if (IsRunning) return;
-        _udp = new UdpClient(AddressFamily.InterNetwork);
-        _udp.Client.Bind(new IPEndPoint(IPAddress.Any, port));
+
+        var udp = new UdpClient(AddressFamily.InterNetwork);
+        try
+        {
+            udp.Client.Bind(new IPEndPoint(IPAddress.Any, port));
+            DisableUdpConnectionReset(udp.Client);
+        }
+        catch
+        {
+            // Don't leak the socket when the port is already taken.
+            udp.Dispose();
+            throw;
+        }
+
+        _udp = udp;
         _cts = CancellationTokenSource.CreateLinkedTokenSource(token);
         IsRunning = true;
 
@@ -68,6 +103,19 @@ public sealed class DhtCrawler : IAsyncDisposable
         _maintenanceLoop = Task.Run(() => MaintenanceLoopAsync(_cts.Token));
 
         await BootstrapAsync(_cts.Token).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// On Windows an ICMP "port unreachable" reply to one of our datagrams makes the *next*
+    /// receive on the socket fail with a reset, which for a node that sends to thousands of dead
+    /// addresses means a constant stream of spurious errors. Turning that off is the standard fix.
+    /// </summary>
+    private static void DisableUdpConnectionReset(Socket socket)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        const int SioUdpConnReset = -1744830452;
+        try { socket.IOControl(SioUdpConnReset, new byte[] { 0, 0, 0, 0 }, null); }
+        catch { /* not fatal; the receive loop tolerates the errors */ }
     }
 
     public async Task StopAsync()
@@ -85,15 +133,11 @@ public sealed class DhtCrawler : IAsyncDisposable
         _udp = null;
     }
 
-    public ValueTask DisposeAsync()
-    {
-        _ = StopAsync();
-        return ValueTask.CompletedTask;
-    }
+    public ValueTask DisposeAsync() => new(StopAsync());
 
     private async Task BootstrapAsync(CancellationToken ct)
     {
-        foreach (var (host, port) in BootstrapNodes)
+        foreach (var (host, port) in _bootstrapNodes)
         {
             try
             {
@@ -209,7 +253,7 @@ public sealed class DhtCrawler : IAsyncDisposable
         if (!dict.TryGetValue("q", out var qVal) || qVal is not BEncodedString method) return;
         if (!dict.TryGetValue("a", out var aVal) || aVal is not BEncodedDictionary args) return;
 
-        QueriesObserved++;
+        Interlocked.Increment(ref _queriesObserved);
 
         if (args.TryGetValue("id", out var idVal) && idVal is BEncodedString idStr && idStr.Span.Length == NodeId.Length)
             LearnNode(new NodeId(idStr.Span.ToArray()), from);
@@ -262,7 +306,22 @@ public sealed class DhtCrawler : IAsyncDisposable
 
         if (r.TryGetValue("nodes", out var nodesVal) && nodesVal is BEncodedString nodesStr)
             foreach (var (id, ep) in DecodeCompactNodes(nodesStr.Span))
-                LearnNode(id, ep);
+                if (IsRoutable(ep))
+                    LearnNode(id, ep);
+    }
+
+    /// <summary>
+    /// Node lists in responses are untrusted. Skip entries that could never be a real remote node
+    /// (port 0, unspecified/loopback/multicast/broadcast addresses) so a hostile or buggy peer
+    /// can't get us to fire find_node traffic at arbitrary local or nonsensical targets.
+    /// </summary>
+    private static bool IsRoutable(IPEndPoint endPoint)
+    {
+        if (endPoint.Port == 0) return false;
+        var bytes = endPoint.Address.GetAddressBytes();
+        if (bytes.Length != 4) return false;
+        if (bytes[0] == 0 || bytes[0] == 127 || bytes[0] >= 224) return false;
+        return true;
     }
 
     private static bool TryReadInfoHash(BEncodedDictionary args, out NodeId infoHash)
@@ -286,10 +345,15 @@ public sealed class DhtCrawler : IAsyncDisposable
     private void RaiseObservation(InfoHashObservation observation)
     {
         if (_seenInfoHashes.TryAdd(observation.InfoHash.ToHex(), 0))
-            InfoHashObserved?.Invoke(observation);
-        else
-            // Already known, but still worth telling listeners it's still alive out there.
-            InfoHashObserved?.Invoke(observation);
+        {
+            Interlocked.Increment(ref _uniqueInfoHashesObserved);
+            if (_seenInfoHashes.Count > MaxRememberedInfoHashes)
+                _seenInfoHashes.Clear();
+        }
+
+        // Every observation is reported, not just the first: a hash that keeps being asked about
+        // is a popular one, which is what the search index uses to rank results.
+        InfoHashObserved?.Invoke(observation);
     }
 
     private void LearnNode(NodeId id, IPEndPoint endPoint)
@@ -401,7 +465,20 @@ public sealed class DhtCrawler : IAsyncDisposable
             { "r", returnValues },
         };
         var bytes = message.Encode();
-        _ = _udp?.SendAsync(bytes, to);
+        _ = SendDatagramAsync(bytes, to);
+    }
+
+    private async Task SendDatagramAsync(byte[] bytes, IPEndPoint to)
+    {
+        try
+        {
+            var udp = _udp;
+            if (udp is not null) await udp.SendAsync(bytes, to).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Replies are best-effort UDP; a failed send (including during shutdown) is not actionable.
+        }
     }
 
     private BEncodedString NextTransactionId()

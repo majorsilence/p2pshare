@@ -16,4 +16,8 @@
     <ProjectReference Include="..\P2PShare.Core\P2PShare.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="P2PShare.Desktop.Tests" />
+  </ItemGroup>
+
 </Project>

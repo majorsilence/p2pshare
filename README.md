@@ -34,6 +34,16 @@ none. Instead:
 4. Picking a result adds its magnet link to the real download engine, which fetches it from the
    swarm over DHT-discovered peers like any BitTorrent client.
 
+### Ranking and de-duplication
+
+Search results are ordered by how often a torrent has been *seen*. Every `get_peers`/`announce_peer`
+the crawler observes for an already-indexed hash bumps that counter (batched, flushed every few
+seconds), so popular torrents rise to the top without any further network traffic. A hash that was
+observed but couldn't be resolved is retried after six hours rather than written off for the
+session, and the "already tried" bookkeeping is size-capped so a long-running crawler's memory
+stays flat. Torrent names come from strangers, so they're stripped of control and
+bidirectional-override characters and length-capped before being stored or shown.
+
 ## Project layout
 
 ```
@@ -42,16 +52,21 @@ src/
     Dht/DhtCrawler.cs         Mainline DHT node + passive info-hash observation
     Dht/NodeId.cs             160-bit DHT node/info-hash type
     Engine/TorrentEngine.cs   MonoTorrent wrapper: metadata fetch, download, seed, torrent creation
-    Search/SearchIndex.cs     SQLite + FTS5 local search index
-    Settings/AppSettings.cs   JSON-persisted user settings
+    Engine/DownloadSource.cs  Parses what the user typed/picked: magnet, bare info-hash, or .torrent path
+    Search/SearchIndex.cs     SQLite + FTS5 local search index (thread-safe)
+    Settings/AppSettings.cs   JSON-persisted settings, saved atomically; remembers downloads and shares
+    Util/ExpiringSet.cs       Size-capped, time-limited "seen recently" set
     P2PShareService.cs        Wires the crawler -> metadata resolver -> search index together
   P2PShare.Desktop/            Majorsilence.Forms UI (desktop today; see "Other platforms" below)
     MainForm.cs                Shell: menu, status bar, tab strip
     Tabs/SearchTab.cs           Query box + results list + download/copy-magnet
     Tabs/DownloadsTab.cs        Active transfers: progress, speed, pause/resume/remove
-    Tabs/LibraryTab.cs          Folders/files you're sharing (seeding)
+    Tabs/LibraryTab.cs          Folders/files you're sharing (seeding), with Stop Sharing
     Tabs/NetworkTab.cs          Crawler stats + live activity log
     Tabs/SettingsTab.cs         Download folder, bandwidth limits, ports
+tests/
+  P2PShare.Core.Tests/        Offline tests: crawler over loopback UDP, index, settings, service
+  P2PShare.Desktop.Tests/     UI smoke tests on Majorsilence.Forms' offscreen (headless) backend
 ```
 
 ## Running it
@@ -64,8 +79,39 @@ dotnet run --project src/P2PShare.Desktop
 ```
 
 Everything (settings, the search database, torrent fast-resume/cache data) lives under
-`~/.p2pshare/`. Downloaded and shared files default to `~/P2PShare Downloads/`, changeable in
-Settings.
+`~/.p2pshare/`. Set the `P2PSHARE_HOME` environment variable to keep it somewhere else (handy for
+a portable install or for running a second, isolated copy). Downloaded and shared files default to
+`~/P2PShare Downloads/`, changeable in Settings.
+
+Downloads you add and folders you share are remembered and resume the next time the app starts;
+**Remove** (Downloads) and **Stop Sharing** (Library) make it forget them again without touching
+your files. If the crawler's UDP port is already taken, the app still starts - the Network tab's
+activity log says so, and downloads and sharing keep working.
+
+## Tests
+
+```bash
+dotnet test
+```
+
+The suite needs no network. `DhtCrawler` is exercised by sending it hand-built KRPC datagrams over
+loopback (ping, `find_node`, `get_peers`, `announce_peer`, plus garbage and malformed input), the
+search index against hostile query/name input, concurrent writers and a database created by the
+first release, and `P2PShareService` end to end with DHT/UPnP/LAN discovery switched off
+(`enableNetwork: false`). The UI tests build every tab on the offscreen backend and render it to a
+PNG; set `P2PSHARE_UI_SNAPSHOTS` to a folder to keep those images.
+
+## Known limitations / next steps
+
+- **Metadata hit-rate.** Resolution relies on MonoTorrent finding peers for each hash. The
+  `announce_peer` observation already carries the announcing peer's address and port, which could be
+  handed to the engine as a direct hint (as magnetico does) - this would resolve far more torrents.
+- **Shares are re-hashed at every start.** A resumed share rebuilds its `.torrent` from the files;
+  large libraries should reuse the cached one when sizes and timestamps still match.
+- **Search covers torrent names only**, not the file names inside a torrent.
+- **The crawler's port isn't forwarded.** Behind a NAT it mostly sees replies to its own queries, not
+  unsolicited ones, so it will index far less than on a machine with the port reachable.
+- **The UI was verified headlessly**, not by clicking through a real Avalonia window.
 
 ## Other platforms ("progressive desktop/mobile")
 

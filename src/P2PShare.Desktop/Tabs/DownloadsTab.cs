@@ -28,7 +28,7 @@ public sealed class DownloadsTab : UserControl
         var resume = new Button { Left = 382, Top = 8, Width = 80, Height = 28, Text = "Resume" };
         resume.Click += (_, _) => WithSelected(h => _service.Engine.ResumeAsync(h));
         var remove = new Button { Left = 466, Top = 8, Width = 80, Height = 28, Text = "Remove" };
-        remove.Click += (_, _) => WithSelected(h => _service.Engine.RemoveAsync(h));
+        remove.Click += (_, _) => WithSelected(h => _service.RemoveTransferAsync(h));
         topPanel.Controls.Add(addMagnet);
         topPanel.Controls.Add(addTorrent);
         topPanel.Controls.Add(pause);
@@ -60,53 +60,66 @@ public sealed class DownloadsTab : UserControl
         _refreshTimer.Start();
     }
 
-    private void AddMagnet()
+    private async void AddMagnet()
     {
-        using var dialog = new PromptDialog("Add Magnet Link", "Paste a magnet: link to start downloading:");
+        using var dialog = new PromptDialog("Add Magnet Link", "Paste a magnet: link (or a 40-character info-hash) to start downloading:");
         var result = FindForm() is Form owner ? dialog.ShowDialog(owner) : dialog.ShowDialog();
         if (result == DialogResult.OK && !string.IsNullOrWhiteSpace(dialog.Value))
-        {
-            try { _ = _service.Engine.StartDownloadAsync(dialog.Value.Trim()); }
-            catch (Exception ex) { MessageBox.Show($"That didn't look like a valid magnet link:\n{ex.Message}", "Add Magnet"); }
-        }
+            await AddAsync(dialog.Value, "Add Magnet");
     }
 
-    private void AddTorrentFile()
+    private async void AddTorrentFile()
     {
         using var dialog = new OpenFileDialog { Filter = "Torrent files (*.torrent)|*.torrent|All files (*.*)|*.*" };
         var result = FindForm() is Form owner ? dialog.ShowDialog(owner) : dialog.ShowDialog();
-        if (result == DialogResult.OK)
+        if (result == DialogResult.OK && !string.IsNullOrWhiteSpace(dialog.FileName))
+            await AddAsync(dialog.FileName, "Add Torrent");
+    }
+
+    // Adding is asynchronous, so errors (a bad magnet, a corrupt .torrent) only surface when it is
+    // awaited. Previously the task was dropped and the user was never told it had failed.
+    private async Task AddAsync(string input, string caption)
+    {
+        try
         {
-            try { _ = _service.Engine.StartDownloadAsync(dialog.FileName); }
-            catch (Exception ex) { MessageBox.Show($"Couldn't load that .torrent file:\n{ex.Message}", "Add Torrent"); }
+            await _service.AddDownloadAsync(input);
+            RefreshList();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Couldn't add that download:\n{ex.Message}", caption);
         }
     }
 
-    private void WithSelected(Func<string, Task> action)
+    private async void WithSelected(Func<string, Task> action)
     {
-        if (_list.SelectedItem?.Tag is TransferSnapshot snapshot)
-            _ = action(snapshot.InfoHashHex);
+        if (_list.SelectedItem?.Tag is not TransferSnapshot snapshot) return;
+
+        try
+        {
+            await action(snapshot.InfoHashHex);
+            RefreshList();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(ex.Message, "P2PShare");
+        }
     }
 
     private void RefreshList()
     {
-        var snapshots = _service.Engine.GetSnapshots();
-
-        _list.BeginUpdate();
-        _list.Items.Clear();
-        foreach (var s in snapshots)
+        _list.Repopulate(_service.Engine.GetSnapshots(), s => s.InfoHashHex, s =>
         {
-            var item = new ListViewItem(s.Name) { Tag = s };
-            item.SubItems.Add($"{s.ProgressPercent:0.0}%");
-            item.SubItems.Add(DescribeState(s.State));
-            item.SubItems.Add($"{P2PShareService.FormatSize(s.DownloadRateBps)}/s");
-            item.SubItems.Add($"{P2PShareService.FormatSize(s.UploadRateBps)}/s");
-            item.SubItems.Add(s.AvailablePeers.ToString());
-            item.SubItems.Add(P2PShareService.FormatSize(s.TotalSize));
-            item.SubItems.Add(s.IsSeedOnly ? "Seed" : "Leech");
-            _list.Items.Add(item);
-        }
-        _list.EndUpdate();
+            var row = new ListViewItem(s.Name);
+            row.SubItems.Add($"{s.ProgressPercent:0.0}%");
+            row.SubItems.Add(DescribeState(s.State));
+            row.SubItems.Add($"{P2PShareService.FormatSize(s.DownloadRateBps)}/s");
+            row.SubItems.Add($"{P2PShareService.FormatSize(s.UploadRateBps)}/s");
+            row.SubItems.Add(s.AvailablePeers.ToString());
+            row.SubItems.Add(P2PShareService.FormatSize(s.TotalSize));
+            row.SubItems.Add(s.IsSeedOnly ? "Seed" : "Leech");
+            return row;
+        });
     }
 
     private static string DescribeState(TorrentState state) => state switch

@@ -75,8 +75,9 @@ public sealed class SearchTab : UserControl
         Controls.Add(_statusLabel);
         Controls.Add(topPanel);
 
-        _service.TorrentIndexed += _ => RunSearchIfLive();
-
+        // New torrents are indexed on background threads. Rather than touching the list from those
+        // threads (UI controls may only be used from the UI thread), the timer - which ticks on
+        // the UI thread - picks up whatever has been added since the last tick.
         _refreshTimer = new Timer { Interval = 4000 };
         _refreshTimer.Tick += (_, _) => RunSearchIfLive();
         _refreshTimer.Start();
@@ -86,6 +87,7 @@ public sealed class SearchTab : UserControl
 
     private void RunSearchIfLive()
     {
+        // Don't refresh while the user is mid-edit: only re-run the query that is currently displayed.
         if (string.Equals(_queryBox.Text, _lastQuery, StringComparison.Ordinal))
             RunSearch();
     }
@@ -95,18 +97,15 @@ public sealed class SearchTab : UserControl
         _lastQuery = _queryBox.Text;
         var results = _service.Index.Search(_queryBox.Text, 300);
 
-        _results.BeginUpdate();
-        _results.Items.Clear();
-        foreach (var r in results)
+        _results.Repopulate(results, r => r.InfoHashHex, r =>
         {
-            var item = new ListViewItem(r.Name) { Tag = r };
-            item.SubItems.Add(P2PShareService.FormatSize(r.TotalSize));
-            item.SubItems.Add(r.FileCount.ToString());
-            item.SubItems.Add(r.SeenCount.ToString());
-            item.SubItems.Add(r.FirstSeenUtc.ToLocalTime().ToString("g"));
-            _results.Items.Add(item);
-        }
-        _results.EndUpdate();
+            var row = new ListViewItem(r.Name);
+            row.SubItems.Add(P2PShareService.FormatSize(r.TotalSize));
+            row.SubItems.Add(r.FileCount.ToString());
+            row.SubItems.Add(r.SeenCount.ToString());
+            row.SubItems.Add(r.FirstSeenUtc.ToLocalTime().ToString("g"));
+            return row;
+        });
 
         var total = _service.Index.TotalIndexed();
         _statusLabel.Text = string.IsNullOrWhiteSpace(_queryBox.Text)
@@ -116,12 +115,20 @@ public sealed class SearchTab : UserControl
 
     private SearchResult? SelectedResult() => _results.SelectedItem?.Tag as SearchResult;
 
-    private void DownloadSelected()
+    private async void DownloadSelected()
     {
         var result = SelectedResult();
         if (result is null) return;
-        _ = _service.Engine.StartDownloadAsync(result.Magnet);
-        MessageBox.Show($"Added to Downloads:\n{result.Name}", "P2PShare");
+
+        try
+        {
+            await _service.AddDownloadAsync(result.Magnet);
+            MessageBox.Show($"Added to Downloads:\n{result.Name}", "P2PShare");
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Couldn't start that download:\n{ex.Message}", "P2PShare");
+        }
     }
 
     private void CopyMagnetSelected()

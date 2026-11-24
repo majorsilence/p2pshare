@@ -3,4 +3,8 @@
     <Project Path="src/P2PShare.Core/P2PShare.Core.csproj" />
     <Project Path="src/P2PShare.Desktop/P2PShare.Desktop.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/P2PShare.Core.Tests/P2PShare.Core.Tests.csproj" />
+    <Project Path="tests/P2PShare.Desktop.Tests/P2PShare.Desktop.Tests.csproj" />
+  </Folder>
 </Solution>
