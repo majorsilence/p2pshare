@@ -203,6 +203,31 @@ public class ServiceTests
     }
 
     [Fact]
+    public async Task A_sample_handed_to_us_does_not_count_as_popularity_but_a_real_query_does()
+    {
+        using var dir = new TempDir();
+        var knownHash = "00000000000000000000000000000000000000bb";
+        using (var index = new SearchIndex(Path.Combine(dir.Path, "search.db")))
+            index.UpsertResolved(new FetchedMetadata(knownHash, "previously indexed", 1, new[] { ("f", 1L) }));
+
+        await using (var service = NewService(OfflineSettings(dir)))
+        {
+            await service.StartAsync(); // starts the loop whose final flush writes the counts on dispose
+            var from = new IPEndPoint(IPAddress.Loopback, 6881);
+            var asked = new P2PShare.Core.Dht.NodeId(Convert.FromHexString(knownHash));
+
+            // Sampled repeatedly (the same hash comes back every time a node is asked again)...
+            for (int i = 0; i < 5; i++)
+                service.OnInfoHashObserved(new P2PShare.Core.Dht.InfoHashObservation(asked, P2PShare.Core.Dht.ObservationKind.Sample, from, null));
+            // ...versus one node genuinely asking about it.
+            service.OnInfoHashObserved(new P2PShare.Core.Dht.InfoHashObservation(asked, P2PShare.Core.Dht.ObservationKind.GetPeers, from, null));
+        } // disposing flushes the pending popularity counts
+
+        using var reopened = new SearchIndex(Path.Combine(dir.Path, "search.db"));
+        Assert.Equal(2, reopened.Get(knownHash)!.SeenCount); // 1 original + the get_peers, not the samples
+    }
+
+    [Fact]
     public async Task Observed_hashes_are_looked_up_once_and_known_ones_only_gain_popularity()
     {
         using var dir = new TempDir();

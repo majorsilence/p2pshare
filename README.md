@@ -16,18 +16,28 @@ Classic Napster/Kazaa/eMule each had their own kind of central or semi-central i
 none. Instead:
 
 1. **`P2PShare.Core/Dht/DhtCrawler.cs`** is a small, self-contained Mainline DHT (BEP 5) node. It
-   bootstraps from the public routers (`router.bittorrent.com`, etc.), does random-walk `find_node`
-   lookups to make itself known to more of the network, and — this is the actual search mechanism —
-   **passively observes the `get_peers` and `announce_peer` queries other real nodes send it**. Every
-   such query carries an info-hash, which means "a torrent with this hash is active somewhere on the
-   network right now." This is the same technique open-source DHT indexers like
+   bootstraps from the public routers (`router.bittorrent.com`, etc.), does random-walk lookups to
+   learn more of the network, and gets info-hashes in two ways, which is the actual search
+   mechanism:
+   - It **asks nodes for samples** (BEP 51, `sample_infohashes`): a node that implements this
+     extension answers with a random sample of the info-hashes it stores. The crawler sends the
+     question, so the answer comes back through any home router or NAT with nothing forwarded; in
+     testing behind a double NAT about a third of the nodes asked answered.
+   - It **passively observes the `get_peers` and `announce_peer` queries other real nodes send it**.
+     Each carries an info-hash that is active somewhere right now, which is also what tells popular
+     torrents from obscure ones. These only arrive if the crawler's UDP port is reachable from
+     outside (see the limitations below).
+
+   This is the family of techniques open-source DHT indexers such as
    [magnetico](https://github.com/boramalper/magnetico) use; it needs no cooperation from anyone and
    scrapes no website.
-2. For each newly observed info-hash, **`P2PShare.Core/Engine/TorrentEngine.cs`** asks MonoTorrent to
+2. For each newly seen info-hash, **`P2PShare.Core/Engine/TorrentEngine.cs`** asks MonoTorrent to
    resolve its real metadata (name, file list, size) over the ordinary BitTorrent wire protocol
-   (BEP 9 `ut_metadata`), using whatever peers MonoTorrent's own DHT lookup finds for that hash.
-   Many hashes will time out — that's expected; it just means nothing is currently reachable for
-   that swarm.
+   (BEP 9 `ut_metadata`), using whatever peers MonoTorrent's own DHT lookup (and the trackers, see
+   below) finds for that hash. Up to 32 lookups run at once, and the engine's connection limits are
+   raised to match; with the defaults they queue behind each other and mostly time out. Many hashes
+   still time out - that just means nothing is reachable for that swarm. In a three-minute test on a
+   home connection about three in ten lookups resolved.
 3. Anything resolved is written to a local SQLite database with an FTS5 full-text index
    (**`P2PShare.Core/Search/SearchIndex.cs`**). The Search tab queries this database. Nothing about
    a search ever leaves your machine.
@@ -38,7 +48,8 @@ none. Instead:
 
 Search results are ordered by how often a torrent has been *seen*. Every `get_peers`/`announce_peer`
 the crawler observes for an already-indexed hash bumps that counter (batched, flushed every few
-seconds), so popular torrents rise to the top without any further network traffic. A hash that was
+seconds), so popular torrents rise to the top without any further network traffic. A hash that a node
+merely handed over as a sample only shows the torrent exists and doesn't raise its count. A hash that was
 observed but couldn't be resolved is retried after six hours rather than written off for the
 session, and the "already tried" bookkeeping is size-capped so a long-running crawler's memory
 stays flat. Torrent names come from strangers, so they're stripped of control and
@@ -53,10 +64,11 @@ for comments, empty for DHT only. Edits apply to the next download, share or loo
 added to magnet links and to `.torrent` downloads (never to private torrents) and are written into
 the `.torrent` file of anything you share.
 
-By default a few of them (never more than four, chosen at random) are also asked for peers when a
-search lookup needs a torrent's metadata, which finds more of them than the DHT alone. A lookup
-contacts the tracker by itself, so the tracker sees your address for torrents you never chose to
-download; untick the option on the Settings tab if you would rather not.
+By default a few of them (each lookup asks at most four, chosen at random) are also asked for peers
+when a search lookup needs a torrent's metadata, which finds more of them than the DHT alone. With
+many lookups running at once that adds up to a few announces a second spread over the list, and a
+lookup contacts the tracker by itself, so the tracker sees your address for torrents you never chose
+to download; untick the option on the Settings tab if you would rather not.
 
 ## Project layout
 
@@ -125,12 +137,15 @@ PNG; set `P2PSHARE_UI_SNAPSHOTS` to a folder to keep those images.
 - **Shares are re-hashed at every start.** A resumed share rebuilds its `.torrent` from the files;
   large libraries should reuse the cached one when sizes and timestamps still match.
 - **Search covers torrent names only**, not the file names inside a torrent.
-- **The crawler's port has to be reachable.** At start-up the app asks the router to forward it (UPnP
-  and NAT-PMP) and takes the mapping out again on exit; the Network tab's log says what happened. That
+- **Popularity needs a reachable crawler port.** Sampling finds torrents with no open port, but the
+  "Seen" counts come from queries other nodes send the crawler, and those only arrive if its UDP
+  port is reachable from outside. At start-up the app asks the router to forward it (UPnP and
+  NAT-PMP) and takes the mapping out again on exit; the Network tab's log says what happened. That
   cannot help when the router itself sits behind another NAT (an ISP modem) or the ISP shares one
-  address between customers - the log says so - and then the index fills much more slowly, because
-  most queries from other nodes never arrive. Forward the UDP port on every device in the chain by
+  address between customers - the log says so. Forward the UDP port on every device in the chain by
   hand, or put the ISP modem in bridge mode.
+- **Sampling depends on other nodes.** BEP 51 is a draft and only some nodes implement it; the
+  Network tab shows how many were asked, how many answered and how many info-hashes came back.
 - **The UI was verified headlessly**, not by clicking through a real Avalonia window.
 
 ## Other platforms ("progressive desktop/mobile")

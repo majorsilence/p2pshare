@@ -20,9 +20,10 @@ public sealed record ActivityEntry(DateTime TimeLocal, string Message);
 /// </summary>
 public sealed class P2PShareService : IAsyncDisposable
 {
-    private const int ResolverWorkerCount = 4;
+    private const int ResolverWorkerCount = 32;
     private const int AttemptedCapacity = 200_000;
     private static readonly TimeSpan MetadataTimeout = TimeSpan.FromSeconds(25);
+    private static readonly TimeSpan WorkerShutdownGrace = TimeSpan.FromSeconds(5);
 
     // A hash that timed out may simply have had no reachable peers at that moment; try it again
     // after a while instead of writing it off for the whole session.
@@ -303,7 +304,7 @@ public sealed class P2PShareService : IAsyncDisposable
     private static string NormalizePath(string path) =>
         Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
 
-    private void OnInfoHashObserved(InfoHashObservation observation)
+    internal void OnInfoHashObserved(InfoHashObservation observation)
     {
         var hex = observation.InfoHash.ToHex().ToLowerInvariant();
 
@@ -312,8 +313,10 @@ public sealed class P2PShareService : IAsyncDisposable
 
         if (known)
         {
-            // Already searchable; just count the sighting so popular torrents rank higher.
-            _pendingSightings.AddOrUpdate(hex, 1, static (_, n) => n + 1);
+            // Already searchable; just count the sighting so popular torrents rank higher. A sample
+            // handed to us only proves the torrent exists, so it must not inflate that count.
+            if (observation.Kind != ObservationKind.Sample)
+                _pendingSightings.AddOrUpdate(hex, 1, static (_, n) => n + 1);
             return;
         }
 
@@ -403,20 +406,28 @@ public sealed class P2PShareService : IAsyncDisposable
         try { _cts?.Cancel(); } catch (ObjectDisposedException) { }
         _resolutionQueue.Writer.TryComplete();
 
-        if (_portMapper is not null)
-        {
-            try { await _portMapper.DisposeAsync().ConfigureAwait(false); }
-            catch (Exception ex) { Log($"Port mapping did not shut down cleanly: {ex.Message}"); }
-        }
+        // Taking the port mapping back out can wait on a slow router, so it runs alongside the rest.
+        var mapperStopping = StopPortMapperAsync();
 
         try { await Crawler.StopAsync().ConfigureAwait(false); }
         catch (Exception ex) { Log($"Crawler did not stop cleanly: {ex.Message}"); }
 
-        try { await Task.WhenAll(_workers).ConfigureAwait(false); }
+        // The workers only wait on cancellable operations, so this is normally instant. The limit is
+        // a backstop: closing the window must never hang on a background lookup.
+        try { await Task.WhenAll(_workers).WaitAsync(WorkerShutdownGrace).ConfigureAwait(false); }
         catch (OperationCanceledException) { }
+        catch (TimeoutException) { Log("Background lookups were still running at shutdown and were abandoned."); }
         catch (Exception ex) { Log($"Background workers did not stop cleanly: {ex.Message}"); }
 
         await Engine.DisposeAsync().ConfigureAwait(false);
+        await mapperStopping.ConfigureAwait(false);
         Index.Dispose();
+    }
+
+    private async Task StopPortMapperAsync()
+    {
+        if (_portMapper is null) return;
+        try { await _portMapper.DisposeAsync().ConfigureAwait(false); }
+        catch (Exception ex) { Log($"Port mapping did not shut down cleanly: {ex.Message}"); }
     }
 }

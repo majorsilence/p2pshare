@@ -8,7 +8,17 @@ using MonoTorrent.BEncoding;
 
 namespace P2PShare.Core.Dht;
 
-public enum ObservationKind { GetPeers, AnnouncePeer }
+public enum ObservationKind
+{
+    GetPeers,
+    AnnouncePeer,
+
+    /// <summary>
+    /// Handed to us by a node we asked (BEP 51 <c>sample_infohashes</c>). The torrent exists, but
+    /// unlike the other two kinds this says nothing about current demand for it.
+    /// </summary>
+    Sample,
+}
 
 public sealed record InfoHashObservation(NodeId InfoHash, ObservationKind Kind, IPEndPoint From, int? Port);
 
@@ -43,6 +53,19 @@ public sealed class DhtCrawler : IAsyncDisposable
     /// </summary>
     private const int MaxRememberedInfoHashes = 200_000;
 
+    // BEP 51 sampling: we ask nodes for a random sample of the info-hashes they store. Because we
+    // send the question, the answer comes back through any NAT - unlike get_peers/announce_peer
+    // traffic, which only reaches us if our UDP port is reachable from outside.
+    private const byte SampleTransactionTag = (byte)'S';
+    private const int MaxSampleQueriesPerTick = 10;
+    private const int MaxSamplesPerResponse = 100;
+    private const int MaxSamplingStates = 100_000;
+    private static readonly TimeSpan SampleReplyTimeout = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan UnsupportedRetry = TimeSpan.FromHours(6);
+    private static readonly TimeSpan MinSampleInterval = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan DefaultSampleInterval = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan MaxSampleInterval = TimeSpan.FromHours(6);
+
     private readonly (string Host, int Port)[] _bootstrapNodes;
     private readonly NodeId _selfId = NodeId.Random();
     private readonly ConcurrentDictionary<string, RoutingEntry> _routingTable = new();
@@ -57,6 +80,11 @@ public sealed class DhtCrawler : IAsyncDisposable
     private byte[] _previousTokenSecret = RandomNumberGenerator.GetBytes(16);
     private long _queriesObserved;
     private long _uniqueInfoHashesObserved;
+    private readonly TimeSpan _maintenanceInterval;
+    private readonly ConcurrentDictionary<string, SampleState> _sampling = new();
+    private long _sampleQueriesSent;
+    private long _sampleReplies;
+    private long _sampledInfoHashes;
 
     public event Action<InfoHashObservation>? InfoHashObserved;
     public event Action<string>? Log;
@@ -66,18 +94,33 @@ public sealed class DhtCrawler : IAsyncDisposable
     public long UniqueInfoHashesObserved => Interlocked.Read(ref _uniqueInfoHashesObserved);
     public bool IsRunning { get; private set; }
 
+    /// <summary>BEP 51 sampling: questions sent, replies that carried samples, and info-hashes received that way.</summary>
+    public long SampleQueriesSent => Interlocked.Read(ref _sampleQueriesSent);
+    public long SampleReplies => Interlocked.Read(ref _sampleReplies);
+    public long SampledInfoHashes => Interlocked.Read(ref _sampledInfoHashes);
+
     /// <summary>The UDP port actually bound (differs from the requested one when 0 was asked for). 0 when stopped.</summary>
     public int LocalPort => (_udp?.Client.LocalEndPoint as IPEndPoint)?.Port ?? 0;
 
     private sealed record RoutingEntry(NodeId Id, IPEndPoint EndPoint, DateTime LastSeenUtc);
 
+    /// <summary>Per remote node: when we may ask it for samples again, and whether a question is in flight.</summary>
+    private sealed class SampleState
+    {
+        public DateTime NextUtc;
+        public DateTime? PendingSince;
+    }
+
     /// <param name="bootstrapNodes">
     /// Hosts to contact to join the network. Defaults to the well-known public routers; pass an
     /// empty list to run isolated (used by tests, which must not touch the real network).
     /// </param>
-    public DhtCrawler(IEnumerable<(string Host, int Port)>? bootstrapNodes = null)
+    /// <param name="maintenanceInterval">How often the crawler does its housekeeping and sends its
+    /// own queries. Defaults to four seconds; tests shorten it.</param>
+    public DhtCrawler(IEnumerable<(string Host, int Port)>? bootstrapNodes = null, TimeSpan? maintenanceInterval = null)
     {
         _bootstrapNodes = bootstrapNodes?.ToArray() ?? PublicBootstrapNodes;
+        _maintenanceInterval = maintenanceInterval ?? TimeSpan.FromSeconds(4);
     }
 
     public async Task StartAsync(int port, CancellationToken token)
@@ -157,7 +200,7 @@ public sealed class DhtCrawler : IAsyncDisposable
 
     private async Task MaintenanceLoopAsync(CancellationToken ct)
     {
-        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(4));
+        using var timer = new PeriodicTimer(_maintenanceInterval);
         var lastSecretRotation = DateTime.UtcNow;
         while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
         {
@@ -184,6 +227,46 @@ public sealed class DhtCrawler : IAsyncDisposable
                 var target = NodeId.RandomCloseTo(entry.Id);
                 await SendFindNodeAsync(entry.EndPoint, target, ct).ConfigureAwait(false);
             }
+
+            await SampleSomeNodesAsync(ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Asks a few nodes that are due for a BEP 51 sample. Most nodes don't implement it, so a node
+    /// that doesn't answer is left alone for hours; one that does tells us how long to wait.
+    /// </summary>
+    private async Task SampleSomeNodesAsync(CancellationToken ct)
+    {
+        var now = DateTime.UtcNow;
+
+        foreach (var state in _sampling.Values)
+        {
+            lock (state)
+            {
+                if (state.PendingSince is { } since && now - since > SampleReplyTimeout)
+                {
+                    state.PendingSince = null;
+                    state.NextUtc = now + UnsupportedRetry;
+                }
+            }
+        }
+
+        int sent = 0;
+        foreach (var entry in _routingTable.Values.OrderBy(_ => Random.Shared.Next()))
+        {
+            if (sent >= MaxSampleQueriesPerTick || ct.IsCancellationRequested) break;
+
+            var state = _sampling.GetOrAdd(entry.EndPoint.ToString(), static _ => new SampleState());
+            lock (state)
+            {
+                if (state.PendingSince is not null || state.NextUtc > now) continue;
+                state.PendingSince = now;
+            }
+
+            Interlocked.Increment(ref _sampleQueriesSent);
+            await SendSampleQueryAsync(entry.EndPoint, NodeId.Random(), ct).ConfigureAwait(false);
+            sent++;
         }
     }
 
@@ -193,6 +276,21 @@ public sealed class DhtCrawler : IAsyncDisposable
         foreach (var kvp in _routingTable)
             if (kvp.Value.LastSeenUtc < cutoff)
                 _routingTable.TryRemove(kvp.Key, out _);
+
+        // Forget only the sampling bookkeeping that no longer constrains us (nothing in flight, no
+        // waiting period left); the rest has to stay so we keep honouring each node's interval.
+        if (_sampling.Count > MaxSamplingStates)
+        {
+            _sampling.Clear();
+        }
+        else if (_sampling.Count > MaxRoutingTableSize * 5)
+        {
+            var now = DateTime.UtcNow;
+            foreach (var kvp in _sampling)
+                lock (kvp.Value)
+                    if (kvp.Value.PendingSince is null && kvp.Value.NextUtc <= now)
+                        _sampling.TryRemove(kvp.Key, out _);
+        }
 
         if (_routingTable.Count <= MaxRoutingTableSize) return;
         foreach (var key in _routingTable.OrderBy(k => k.Value.LastSeenUtc).Take(_routingTable.Count - MaxRoutingTableSize).Select(k => k.Key))
@@ -244,7 +342,7 @@ public sealed class DhtCrawler : IAsyncDisposable
                 HandleQuery(dict, transactionId, from);
                 break;
             case "r":
-                HandleResponse(dict, from);
+                HandleResponse(dict, transactionId, from);
                 break;
             // "e" (error) messages are not actionable for a crawler; ignore.
         }
@@ -299,7 +397,7 @@ public sealed class DhtCrawler : IAsyncDisposable
         }
     }
 
-    private void HandleResponse(BEncodedDictionary dict, IPEndPoint from)
+    private void HandleResponse(BEncodedDictionary dict, BEncodedString transactionId, IPEndPoint from)
     {
         if (!dict.TryGetValue("r", out var rVal) || rVal is not BEncodedDictionary r) return;
 
@@ -310,6 +408,53 @@ public sealed class DhtCrawler : IAsyncDisposable
             foreach (var (id, ep) in DecodeCompactNodes(nodesStr.Span))
                 if (IsRoutable(ep))
                     LearnNode(id, ep);
+
+        // BEP 51: a node that supports sampling always includes "samples", even when empty. A reply
+        // to our sampling question that lacks it comes from a node that doesn't.
+        if (r.TryGetValue("samples", out var samplesVal) && samplesVal is BEncodedString samples)
+            HandleSamples(r, samples, from);
+        else if (transactionId.Span.Length == 2 && transactionId.Span[0] == SampleTransactionTag)
+            MarkSamplingUnsupported(from);
+    }
+
+    private void HandleSamples(BEncodedDictionary r, BEncodedString samples, IPEndPoint from)
+    {
+        // Believe a reply only if we asked this very address a moment ago. Otherwise anyone could
+        // push made-up hashes into the metadata queue.
+        if (!_sampling.TryGetValue(from.ToString(), out var state)) return;
+
+        var interval = DefaultSampleInterval;
+        if (r.TryGetValue("interval", out var intervalVal) && intervalVal is BEncodedNumber seconds)
+            interval = TimeSpan.FromSeconds(Math.Clamp(seconds.Number, 0, (long)MaxSampleInterval.TotalSeconds));
+        if (interval < MinSampleInterval) interval = MinSampleInterval;
+
+        lock (state)
+        {
+            if (state.PendingSince is null) return;
+            state.PendingSince = null;
+            state.NextUtc = DateTime.UtcNow + interval;
+        }
+
+        Interlocked.Increment(ref _sampleReplies);
+        var span = samples.Span;
+        int count = Math.Min(span.Length / NodeId.Length, MaxSamplesPerResponse);
+        for (int i = 0; i < count; i++)
+        {
+            var hash = new NodeId(span.Slice(i * NodeId.Length, NodeId.Length).ToArray());
+            Interlocked.Increment(ref _sampledInfoHashes);
+            RaiseObservation(new InfoHashObservation(hash, ObservationKind.Sample, from, null));
+        }
+    }
+
+    private void MarkSamplingUnsupported(IPEndPoint from)
+    {
+        if (!_sampling.TryGetValue(from.ToString(), out var state)) return;
+        lock (state)
+        {
+            if (state.PendingSince is null) return;
+            state.PendingSince = null;
+            state.NextUtc = DateTime.UtcNow + UnsupportedRetry;
+        }
     }
 
     /// <summary>
@@ -438,11 +583,21 @@ public sealed class DhtCrawler : IAsyncDisposable
         await SendQueryAsync(target, "find_node", args, ct).ConfigureAwait(false);
     }
 
-    private async Task SendQueryAsync(IPEndPoint target, string method, BEncodedDictionary args, CancellationToken ct)
+    private async Task SendSampleQueryAsync(IPEndPoint target, NodeId searchTarget, CancellationToken ct)
+    {
+        // "target" only steers which close nodes come back (so each question also walks the
+        // keyspace); it has no effect on which samples a node returns.
+        var args = new BEncodedDictionary { { "id", SelfIdValue() }, { "target", new BEncodedString(searchTarget.ToBytes()) } };
+        var transactionId = new BEncodedString(new[] { SampleTransactionTag, (byte)_rnd.Next(256) });
+        await SendQueryAsync(target, "sample_infohashes", args, ct, transactionId).ConfigureAwait(false);
+    }
+
+    private async Task SendQueryAsync(
+        IPEndPoint target, string method, BEncodedDictionary args, CancellationToken ct, BEncodedString? transactionId = null)
     {
         var message = new BEncodedDictionary
         {
-            { "t", NextTransactionId() },
+            { "t", transactionId ?? NextTransactionId() },
             { "y", new BEncodedString("q") },
             { "q", new BEncodedString(method) },
             { "a", args },
@@ -487,6 +642,8 @@ public sealed class DhtCrawler : IAsyncDisposable
     {
         var bytes = new byte[2];
         _rnd.NextBytes(bytes);
+        // The tag marks transaction ids of our sampling questions; keep ordinary ones out of that space.
+        if (bytes[0] == SampleTransactionTag) bytes[0] ^= 1;
         return new BEncodedString(bytes);
     }
 }

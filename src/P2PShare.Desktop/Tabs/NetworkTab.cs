@@ -17,6 +17,7 @@ public sealed class NetworkTab : UserControl
     private readonly Label _queriesLabel;
     private readonly Label _uniqueHashesLabel;
     private readonly Label _lookupsLabel;
+    private readonly Label _samplingLabel;
     private readonly Label _engineDhtLabel;
     private readonly TextBox _log;
     private readonly Queue<string> _logLines = new();
@@ -27,7 +28,7 @@ public sealed class NetworkTab : UserControl
         _service = service;
         BackColor = Theme.PanelBackground;
 
-        var statsPanel = new Panel { Dock = DockStyle.Top, Height = 176 };
+        var statsPanel = new Panel { Dock = DockStyle.Top, Height = 200 };
 
         var explanation = new Label
         {
@@ -43,13 +44,15 @@ public sealed class NetworkTab : UserControl
         _queriesLabel = MakeStatLabel("DHT queries observed: 0", 10, 72);
         _uniqueHashesLabel = MakeStatLabel("Unique info-hashes observed: 0", 10, 96);
         _lookupsLabel = MakeStatLabel("Metadata lookups: 0 tried, 0 resolved, 0 waiting", 10, 120);
-        _engineDhtLabel = MakeStatLabel("Download engine DHT: starting...", 10, 144);
+        _samplingLabel = MakeStatLabel("Sampling nodes for info-hashes: 0 asked, 0 answered, 0 received", 10, 144);
+        _engineDhtLabel = MakeStatLabel("Download engine DHT: starting...", 10, 168);
 
         statsPanel.Controls.Add(explanation);
         statsPanel.Controls.Add(_crawlerNodesLabel);
         statsPanel.Controls.Add(_queriesLabel);
         statsPanel.Controls.Add(_uniqueHashesLabel);
         statsPanel.Controls.Add(_lookupsLabel);
+        statsPanel.Controls.Add(_samplingLabel);
         statsPanel.Controls.Add(_engineDhtLabel);
 
         var logLabel = new Label { Dock = DockStyle.Bottom, Height = 20, Text = "Activity log:" };
@@ -118,6 +121,9 @@ public sealed class NetworkTab : UserControl
         _queriesLabel.Text = $"DHT queries observed: {_service.Crawler.QueriesObserved}";
         _uniqueHashesLabel.Text = $"Unique info-hashes observed: {_service.Crawler.UniqueInfoHashesObserved}";
         _lookupsLabel.Text = $"Metadata lookups: {_service.LookupsAttempted} tried, {_service.LookupsResolved} resolved, {_service.LookupsQueued} waiting";
+        _samplingLabel.Text =
+            $"Sampling nodes for info-hashes: {_service.Crawler.SampleQueriesSent} asked, " +
+            $"{_service.Crawler.SampleReplies} answered, {_service.Crawler.SampledInfoHashes} received";
         _engineDhtLabel.Text = $"Download engine DHT: {_service.Engine.Dht.State}, {_service.Engine.Dht.NodeCount} node(s)";
     }
 }

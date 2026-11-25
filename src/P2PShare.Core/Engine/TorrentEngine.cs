@@ -59,6 +59,10 @@ public sealed class TorrentEngine : IAsyncDisposable
             AutoSaveLoadDhtCache = true,
             AutoSaveLoadFastResume = true,
             AutoSaveLoadMagnetLinkMetadata = true,
+            // Search lookups run many torrents at once, each trying to reach peers; the defaults (8
+            // half-open, 150 total) make them queue behind each other and mostly time out.
+            MaximumHalfOpenConnections = 64,
+            MaximumConnections = 400,
             MaximumDownloadRate = options.MaximumDownloadRateBytesPerSecond,
             MaximumUploadRate = options.MaximumUploadRateBytesPerSecond,
         }.ToSettings();
@@ -92,7 +96,22 @@ public sealed class TorrentEngine : IAsyncDisposable
             // often can't.
             var magnet = new MagnetLink(
                 InfoHash.FromHex(infoHashHex), null, trackers is { Count: > 0 } ? trackers.ToList() : null, null, null);
-            var metadata = await _engine.DownloadMetadataAsync(magnet, cts.Token).ConfigureAwait(false);
+            // MonoTorrent does not always return promptly when this token is cancelled (a lookup that
+            // has found peers can take a very long time to wind down, or never do so). Waiting on it
+            // directly would pin a worker - and block shutdown - so stop waiting at the deadline and
+            // let the engine finish its own cleanup in the background.
+            var fetch = _engine.DownloadMetadataAsync(magnet, cts.Token);
+            ReadOnlyMemory<byte> metadata;
+            try
+            {
+                metadata = await fetch.WaitAsync(cts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                AbandonLookup(fetch);
+                return null;
+            }
+
             var torrent = Torrent.Load(metadata.Span);
             var files = torrent.Files.Select(f => (f.Path, f.Length)).ToList();
             return new FetchedMetadata(infoHashHex, torrent.Name, torrent.Size, files);
@@ -105,6 +124,30 @@ public sealed class TorrentEngine : IAsyncDisposable
         {
             return null;
         }
+    }
+
+    private int _abandonedLookups;
+
+    /// <summary>
+    /// Metadata lookups that timed out or were cancelled but whose MonoTorrent-side cleanup has not
+    /// finished yet. Normally a handful; a large number means the engine is not cleaning up.
+    /// </summary>
+    public int AbandonedLookups => Volatile.Read(ref _abandonedLookups);
+
+    private void AbandonLookup(Task fetch)
+    {
+        if (fetch.IsCompleted)
+        {
+            _ = fetch.Exception; // observed, so it can't surface later as an unobserved task exception
+            return;
+        }
+
+        Interlocked.Increment(ref _abandonedLookups);
+        fetch.ContinueWith(static (t, state) =>
+        {
+            Interlocked.Decrement(ref ((TorrentEngine)state!)._abandonedLookups);
+            _ = t.Exception;
+        }, this, TaskScheduler.Default);
     }
 
     /// <summary>
