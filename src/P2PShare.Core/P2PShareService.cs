@@ -25,6 +25,14 @@ public sealed class P2PShareService : IAsyncDisposable
     private static readonly TimeSpan MetadataTimeout = TimeSpan.FromSeconds(25);
     private static readonly TimeSpan WorkerShutdownGrace = TimeSpan.FromSeconds(5);
 
+    // Seeder counts: one batch per round, per tracker. Deliberately unhurried - these are free
+    // public services.
+    private const int MaxTrackersPerScrape = 8;
+    private static readonly TimeSpan ScrapeInterval = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan ScrapeMaxAge = TimeSpan.FromMinutes(30);
+    private static readonly TimeSpan ScrapeBackoff = TimeSpan.FromMinutes(5);
+    private readonly TrackerScraper _scraper = new();
+
     // A hash that timed out may simply have had no reachable peers at that moment; try it again
     // after a while instead of writing it off for the whole session.
     private static readonly TimeSpan RetryAfter = TimeSpan.FromHours(6);
@@ -156,6 +164,7 @@ public sealed class P2PShareService : IAsyncDisposable
         for (int i = 0; i < ResolverWorkerCount; i++)
             _workers.Add(Task.Run(() => ResolveWorkerAsync(token)));
         _workers.Add(Task.Run(() => FlushSightingsLoopAsync(token)));
+        if (_enableNetwork) _workers.Add(Task.Run(() => ScrapeLoopAsync(token)));
 
         try
         {
@@ -352,6 +361,65 @@ public sealed class P2PShareService : IAsyncDisposable
         catch (Exception ex) { Log($"Could not record popularity counts: {ex.Message}"); }
     }
 
+    /// <summary>
+    /// Keeps seeder counts for indexed torrents up to date. It works through the index on its own
+    /// schedule and is never triggered by a search, so what you search for stays on this machine.
+    /// </summary>
+    private async Task ScrapeLoopAsync(CancellationToken token)
+    {
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(5), token).ConfigureAwait(false);
+            while (true)
+            {
+                var wait = ScrapeInterval;
+                try
+                {
+                    if (await ScrapeOnceAsync(token).ConfigureAwait(false) is null)
+                    {
+                        Log("No tracker answered a request for seeder counts; trying again in a few minutes.");
+                        wait = ScrapeBackoff;
+                    }
+                }
+                catch (Exception ex) when (!token.IsCancellationRequested)
+                {
+                    Log($"Could not update seeder counts: {ex.Message}");
+                    wait = ScrapeBackoff;
+                }
+
+                await Task.Delay(wait, token).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    /// <summary>
+    /// One round: asks the trackers about the torrents whose counts are most out of date. Returns
+    /// how many were updated (0 if there was nothing to do), or null if no tracker answered.
+    /// </summary>
+    internal async Task<int?> ScrapeOnceAsync(CancellationToken token)
+    {
+        string[] trackers;
+        lock (Settings.SyncRoot)
+        {
+            if (!Settings.ScrapeSeederCounts) return 0;
+            trackers = Settings.Trackers.ToArray();
+        }
+        if (trackers.Length == 0) return 0;
+
+        var batch = Index.HashesNeedingScrape(TrackerScraper.MaxHashesPerUdpRequest, ScrapeMaxAge);
+        if (batch.Count == 0) return 0;
+
+        if (trackers.Length > MaxTrackersPerScrape)
+            trackers = trackers.OrderBy(_ => Random.Shared.Next()).Take(MaxTrackersPerScrape).ToArray();
+
+        var counts = await _scraper.ScrapeAsync(trackers, batch, token).ConfigureAwait(false);
+        if (counts.Count == 0) return null;
+
+        Index.RecordScrape(counts);
+        return counts.Count;
+    }
+
     private async Task ResolveWorkerAsync(CancellationToken token)
     {
         try
@@ -421,6 +489,7 @@ public sealed class P2PShareService : IAsyncDisposable
 
         await Engine.DisposeAsync().ConfigureAwait(false);
         await mapperStopping.ConfigureAwait(false);
+        _scraper.Dispose();
         Index.Dispose();
     }
 

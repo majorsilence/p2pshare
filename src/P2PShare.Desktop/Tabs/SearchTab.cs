@@ -13,7 +13,11 @@ public sealed class SearchTab : UserControl
     private readonly ListView _results;
     private readonly Label _statusLabel;
     private readonly Timer _refreshTimer;
+    private readonly ComboBox _category;
+    private readonly CheckBox _hideAdult;
     private string _lastQuery = "";
+
+    private const string AllCategories = "All categories";
 
     public SearchTab(P2PShareService service)
     {
@@ -37,9 +41,19 @@ public sealed class SearchTab : UserControl
         var clearButton = new Button { Left = 534, Top = 10, Width = 70, Height = 26, Text = "Clear" };
         clearButton.Click += (_, _) => { _queryBox.Text = ""; RunSearch(); };
 
+        _category = new ComboBox { Left = 620, Top = 11, Width = 150, DropDownStyle = ComboBoxStyle.DropDownList };
+        _category.Items.Add(AllCategories);
+        foreach (var name in Enum.GetNames<ContentCategory>()) _category.Items.Add(name);
+        _category.SelectedIndex = 0;
+
+        // Public DHT traffic includes plenty of adult material; leave it out unless asked for.
+        _hideAdult = new CheckBox { Left = 782, Top = 12, Width = 110, Height = 24, Text = "Hide adult", Checked = true };
+
         topPanel.Controls.Add(_queryBox);
         topPanel.Controls.Add(searchButton);
         topPanel.Controls.Add(clearButton);
+        topPanel.Controls.Add(_category);
+        topPanel.Controls.Add(_hideAdult);
 
         _statusLabel = new Label
         {
@@ -57,11 +71,14 @@ public sealed class SearchTab : UserControl
             GridLines = true,
             MultiSelect = false,
         };
-        _results.Columns.Add("Name", 420);
-        _results.Columns.Add("Size", 90);
-        _results.Columns.Add("Files", 60);
-        _results.Columns.Add("Seen", 60);
-        _results.Columns.Add("First seen", 140);
+        _results.Columns.Add("Name", 380);
+        _results.Columns.Add("Category", 80);
+        _results.Columns.Add("Size", 85);
+        _results.Columns.Add("Seeds", 60);
+        _results.Columns.Add("Leechers", 70);
+        _results.Columns.Add("Files", 50);
+        _results.Columns.Add("Seen", 50);
+        _results.Columns.Add("First seen", 130);
 
         var context = new ContextMenuStrip();
         var downloadItem = new ToolStripMenuItem("Download", null, (_, _) => DownloadSelected());
@@ -82,6 +99,10 @@ public sealed class SearchTab : UserControl
         _refreshTimer.Tick += (_, _) => RunSearchIfLive();
         _refreshTimer.Start();
 
+        // Hooked up only now, so that building the controls above doesn't run a half-made search.
+        _category.SelectedIndexChanged += (_, _) => RunSearch();
+        _hideAdult.CheckedChanged += (_, _) => RunSearch();
+
         RunSearch();
     }
 
@@ -95,12 +116,17 @@ public sealed class SearchTab : UserControl
     private void RunSearch()
     {
         _lastQuery = _queryBox.Text;
-        var results = _service.Index.Search(_queryBox.Text, 300);
+        ContentCategory? category = Enum.TryParse<ContentCategory>(_category.SelectedItem?.ToString(), out var chosen) ? chosen : null;
+        var results = _service.Index.Search(_queryBox.Text, 300, category, excludeAdult: _hideAdult.Checked);
 
         _results.Repopulate(results, r => r.InfoHashHex, r =>
         {
             var row = new ListViewItem(r.Name);
+            row.SubItems.Add(r.Category.ToString());
             row.SubItems.Add(P2PShareService.FormatSize(r.TotalSize));
+            // "-" = no tracker has answered yet; 0 = trackers know of nobody.
+            row.SubItems.Add(r.Seeders?.ToString() ?? "-");
+            row.SubItems.Add(r.Leechers?.ToString() ?? "-");
             row.SubItems.Add(r.FileCount.ToString());
             row.SubItems.Add(r.SeenCount.ToString());
             row.SubItems.Add(r.FirstSeenUtc.ToLocalTime().ToString("g"));

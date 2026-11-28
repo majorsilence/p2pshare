@@ -40,6 +40,9 @@ public sealed class AppSettings
     /// <summary>Also let the background search lookups ask a few of the trackers for peers.</summary>
     public bool UseTrackersForLookups { get; set; } = true;
 
+    /// <summary>Periodically ask the trackers how many seeders each indexed torrent has.</summary>
+    public bool ScrapeSeederCounts { get; set; } = true;
+
     /// <summary>
     /// Held while the lists above are mutated or serialized, so a background thread adding a
     /// download can't corrupt a save that the UI thread triggers at the same moment.

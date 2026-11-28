@@ -46,14 +46,39 @@ none. Instead:
 
 ### Ranking and de-duplication
 
-Search results are ordered by how often a torrent has been *seen*. Every `get_peers`/`announce_peer`
-the crawler observes for an already-indexed hash bumps that counter (batched, flushed every few
-seconds), so popular torrents rise to the top without any further network traffic. A hash that a node
-merely handed over as a sample only shows the torrent exists and doesn't raise its count. A hash that was
-observed but couldn't be resolved is retried after six hours rather than written off for the
-session, and the "already tried" bookkeeping is size-capped so a long-running crawler's memory
-stays flat. Torrent names come from strangers, so they're stripped of control and
-bidirectional-override characters and length-capped before being stored or shown.
+Search results are ordered by seeder count (see below): torrents with seeders first, then those not
+yet checked, then those trackers know nobody for. Ties go to how often a torrent has been *seen* -
+every `get_peers`/`announce_peer` the crawler observes for an already-indexed hash bumps that counter
+(batched, flushed every few seconds). A hash that a node merely handed over as a sample only shows the
+torrent exists and doesn't raise its count. A hash that was observed but couldn't be resolved is
+retried after six hours rather than written off for the session, and the "already tried" bookkeeping
+is size-capped so a long-running crawler's memory stays flat. Torrent names come from strangers, so
+they're stripped of control and bidirectional-override characters and length-capped before being
+stored or shown.
+
+The index is a SQLite file, `search.db`, in the app's data folder. It persists between runs, and a
+hash that is already in it is not looked up again. A database from an earlier version is upgraded
+when it is opened.
+
+### Seeder counts
+
+The Seeds and Leechers columns come from tracker *scrapes* (BEP 15 for UDP, BEP 48 for HTTP), which
+read a tracker's counters without joining the swarm. Every 15 seconds the app asks about one batch of
+up to 70 indexed torrents - new ones first, then those not checked for 30 minutes - and keeps the
+highest figure any tracker gives. `-` means not checked yet; `0` means the trackers know of nobody,
+which doesn't rule out finding peers over the DHT.
+
+This runs on its own schedule and is never triggered by a search, so searches still stay on your
+machine. It does tell the trackers which torrents are in your index; untick "Show seeder counts" on
+the Settings tab to stop that.
+
+### Categories
+
+Each torrent is labelled Video, TV, Music, Books, Software, Games, Images, Adult or Other, mainly by
+which kind of file holds most of its bytes, with the name as a tie-breaker
+(**`Search/ContentClassifier.cs`**). The Search tab can filter on the label, and **Hide adult** is on
+by default. It is a guess from text written by strangers: expect some mistakes in both directions,
+and don't rely on it as a safety filter.
 
 ### Trackers
 
@@ -81,7 +106,9 @@ src/
     Engine/DownloadSource.cs  Parses what the user typed/picked: magnet, bare info-hash, or .torrent path
     Net/PortMapper.cs         Asks the router (UPnP / NAT-PMP) to forward the crawler's UDP port
     Net/TrackerList.cs        Built-in, user-editable list of tracker announce URLs
+    Net/TrackerScraper.cs     Seeder/leecher counts from UDP and HTTP tracker scrapes
     Search/SearchIndex.cs     SQLite + FTS5 local search index (thread-safe)
+    Search/ContentClassifier.cs  Guesses each torrent's category
     Settings/AppSettings.cs   JSON-persisted settings, saved atomically; remembers downloads and shares
     Util/ExpiringSet.cs       Size-capped, time-limited "seen recently" set
     P2PShareService.cs        Wires the crawler -> metadata resolver -> search index together

@@ -10,4 +10,9 @@ public sealed record SearchResult(
     DateTime FirstSeenUtc,
     DateTime LastSeenUtc,
     int SeenCount,
-    string Magnet);
+    string Magnet,
+    ContentCategory Category = ContentCategory.Other,
+    // From tracker scrapes; null until a tracker has answered for this torrent. Zero means trackers
+    // know no peers, which doesn't rule out finding some over the DHT.
+    int? Seeders = null,
+    int? Leechers = null);

@@ -16,6 +16,7 @@ public sealed class SettingsTab : UserControl
     private readonly NumericUpDown _crawlerPort;
     private readonly TextBox _trackers;
     private readonly CheckBox _trackersForLookups;
+    private readonly CheckBox _seederCounts;
 
     public SettingsTab(P2PShareService service)
     {
@@ -30,7 +31,7 @@ public sealed class SettingsTab : UserControl
         downloadsGroup.Controls.Add(_downloadsPath);
         downloadsGroup.Controls.Add(browse);
 
-        var bandwidthGroup = new GroupBox { Left = 12, Top = 92, Width = 700, Height = 90, Text = "Bandwidth limits (0 = unlimited)" };
+        var bandwidthGroup = new GroupBox { Left = 12, Top = 90, Width = 700, Height = 66, Text = "Bandwidth limits (0 = unlimited)" };
         var maxDownLabel = new Label { Left = 12, Top = 30, Width = 160, Text = "Max download (KB/s):" };
         _maxDownload = new NumericUpDown { Left = 180, Top = 28, Width = 100, Maximum = 1_000_000, Value = Clamp(service.Settings.MaxDownloadKBps, 0, 1_000_000) };
         var maxUpLabel = new Label { Left = 300, Top = 30, Width = 150, Text = "Max upload (KB/s):" };
@@ -40,7 +41,7 @@ public sealed class SettingsTab : UserControl
         bandwidthGroup.Controls.Add(maxUpLabel);
         bandwidthGroup.Controls.Add(_maxUpload);
 
-        var portsGroup = new GroupBox { Left = 12, Top = 192, Width = 700, Height = 90, Text = "Network ports" };
+        var portsGroup = new GroupBox { Left = 12, Top = 164, Width = 700, Height = 66, Text = "Network ports" };
         var listenLabel = new Label { Left = 12, Top = 30, Width = 110, Text = "Listen port:" };
         _listenPort = new NumericUpDown { Left = 130, Top = 28, Width = 90, Minimum = 1024, Maximum = 65535, Value = ClampPort(service.Settings.ListenPort) };
         var dhtLabel = new Label { Left = 240, Top = 30, Width = 90, Text = "DHT port:" };
@@ -54,7 +55,7 @@ public sealed class SettingsTab : UserControl
         portsGroup.Controls.Add(crawlerLabel);
         portsGroup.Controls.Add(_crawlerPort);
 
-        var trackersGroup = new GroupBox { Left = 12, Top = 292, Width = 700, Height = 205, Text = "Trackers" };
+        var trackersGroup = new GroupBox { Left = 12, Top = 238, Width = 700, Height = 231, Text = "Trackers" };
         var trackersHelp = new Label
         {
             Left = 12, Top = 22, Width = 676, Height = 18,
@@ -75,20 +76,27 @@ public sealed class SettingsTab : UserControl
             Text = "Also ask a few trackers for peers when looking up search results",
             Checked = service.Settings.UseTrackersForLookups,
         };
+        _seederCounts = new CheckBox
+        {
+            Left = 12, Top = 192, Width = 520, Height = 24,
+            Text = "Show seeder counts (asks trackers about the torrents in your index)",
+            Checked = service.Settings.ScrapeSeederCounts,
+        };
         var resetTrackers = new Button { Left = 560, Top = 162, Width = 128, Height = 26, Text = "Reset to defaults" };
         resetTrackers.Click += (_, _) => _trackers.Text = TrackerList.ToText(TrackerList.Defaults);
         trackersGroup.Controls.Add(trackersHelp);
         trackersGroup.Controls.Add(_trackers);
         trackersGroup.Controls.Add(_trackersForLookups);
+        trackersGroup.Controls.Add(_seederCounts);
         trackersGroup.Controls.Add(resetTrackers);
 
         var hint = new Label
         {
-            Left = 12, Top = 507, Width = 700, Height = 20,
+            Left = 12, Top = 477, Width = 700, Height = 20,
             Text = "Ports and bandwidth apply on the next start. Tracker edits apply to anything added afterwards.",
         };
 
-        var save = new Button { Left = 12, Top = 535, Width = 120, Height = 30, Text = "Save Settings" };
+        var save = new Button { Left = 12, Top = 503, Width = 120, Height = 30, Text = "Save Settings" };
         save.Click += (_, _) => Save();
 
         Controls.Add(downloadsGroup);
@@ -129,6 +137,7 @@ public sealed class SettingsTab : UserControl
         {
             _service.Settings.Trackers = trackers.Valid.ToList();
             _service.Settings.UseTrackersForLookups = _trackersForLookups.Checked;
+            _service.Settings.ScrapeSeederCounts = _seederCounts.Checked;
         }
 
         _service.Settings.DownloadsDirectory = _downloadsPath.Text;

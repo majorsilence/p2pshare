@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
 using P2PShare.Core.Engine;
+using P2PShare.Core.Net;
 
 namespace P2PShare.Core.Search;
 
@@ -24,8 +25,16 @@ public sealed class SearchIndex : IDisposable
     /// <summary>Only this many file entries are kept per torrent (the real count is still recorded).</summary>
     public const int MaxStoredFiles = 1000;
 
+    // Column order matters to ReadResult. Every query reads from "torrents t".
     private const string SelectColumns =
-        "info_hash, name, total_size, file_count, first_seen_utc, last_seen_utc, seen_count, magnet";
+        "t.info_hash, t.name, t.total_size, t.file_count, t.first_seen_utc, t.last_seen_utc, t.seen_count, t.magnet, " +
+        "t.category, t.seeders, t.leechers";
+
+    // Torrents trackers know seeders for come first (most seeded on top), then those not yet
+    // checked, then those trackers know nobody for.
+    private const string Ranking =
+        "CASE WHEN t.seeders > 0 THEN t.seeders WHEN t.seeders IS NULL THEN 0 ELSE -1 END DESC, " +
+        "t.seen_count DESC, t.last_seen_utc DESC";
 
     private readonly object _gate = new();
     private readonly SqliteConnection _connection;
@@ -51,13 +60,90 @@ public sealed class SearchIndex : IDisposable
                     magnet TEXT NOT NULL,
                     first_seen_utc TEXT NOT NULL,
                     last_seen_utc TEXT NOT NULL,
-                    seen_count INTEGER NOT NULL DEFAULT 1
+                    seen_count INTEGER NOT NULL DEFAULT 1,
+                    category TEXT,
+                    seeders INTEGER,
+                    leechers INTEGER,
+                    scraped_utc TEXT
                 );
                 """;
             cmd.ExecuteNonQuery();
         }
 
+        // Before any row is updated below: this replaces the first release's over-eager update trigger.
         _ftsAvailable = TryEnableFullTextSearch();
+
+        AddMissingColumns(("category", "TEXT"), ("seeders", "INTEGER"), ("leechers", "INTEGER"), ("scraped_utc", "TEXT"));
+        CategoriseUncategorised();
+    }
+
+    /// <summary>Brings a database made by an earlier version up to the current columns.</summary>
+    private void AddMissingColumns(params (string Name, string Type)[] columns)
+    {
+        var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (var cmd = _connection.CreateCommand())
+        {
+            cmd.CommandText = "SELECT name FROM pragma_table_info('torrents')";
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read()) existing.Add(reader.GetString(0));
+        }
+
+        foreach (var (name, type) in columns)
+        {
+            if (existing.Contains(name)) continue;
+            using var cmd = _connection.CreateCommand();
+            cmd.CommandText = $"ALTER TABLE torrents ADD COLUMN {name} {type}"; // fixed names from above
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>
+    /// Rows indexed before categories existed, or labelled by an older set of rules, are classified
+    /// from what was stored for them.
+    /// </summary>
+    private void CategoriseUncategorised()
+    {
+        // user_version records which rules the stored labels came from.
+        using (var version = _connection.CreateCommand())
+        {
+            version.CommandText = "PRAGMA user_version";
+            if (Convert.ToInt32(version.ExecuteScalar(), CultureInfo.InvariantCulture) != ContentClassifier.Version)
+            {
+                version.CommandText = $"UPDATE torrents SET category = NULL; PRAGMA user_version = {ContentClassifier.Version};";
+                version.ExecuteNonQuery();
+            }
+        }
+
+        var pending = new List<(long Id, string Name, string FilesJson)>();
+        using (var cmd = _connection.CreateCommand())
+        {
+            cmd.CommandText = "SELECT id, name, files_json FROM torrents WHERE category IS NULL";
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read()) pending.Add((reader.GetInt64(0), reader.GetString(1), reader.GetString(2)));
+        }
+        if (pending.Count == 0) return;
+
+        using var tx = _connection.BeginTransaction();
+        using var update = _connection.CreateCommand();
+        update.Transaction = tx;
+        update.CommandText = "UPDATE torrents SET category = $category WHERE id = $id";
+        var categoryParam = update.Parameters.Add("$category", SqliteType.Text);
+        var idParam = update.Parameters.Add("$id", SqliteType.Integer);
+
+        foreach (var (id, name, filesJson) in pending)
+        {
+            List<IndexedFile>? files = null;
+            try { files = JsonSerializer.Deserialize<List<IndexedFile>>(filesJson); }
+            catch (JsonException) { /* classify from the name alone */ }
+
+            idParam.Value = id;
+            categoryParam.Value = ContentClassifier
+                .Classify(name, (files ?? new()).Select(f => (f.Path, f.Length)))
+                .ToString();
+            update.ExecuteNonQuery();
+        }
+
+        tx.Commit();
     }
 
     private bool TryEnableFullTextSearch()
@@ -101,21 +187,24 @@ public sealed class SearchIndex : IDisposable
         var filesJson = JsonSerializer.Serialize(
             metadata.Files.Take(MaxStoredFiles).Select(f => new IndexedFile(f.Path, f.Length)));
         var nowIso = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
+        var category = ContentClassifier.Classify(name, metadata.Files);
 
         lock (_gate)
         {
             using var cmd = _connection.CreateCommand();
             cmd.CommandText = """
-                INSERT INTO torrents (info_hash, name, total_size, file_count, files_json, magnet, first_seen_utc, last_seen_utc, seen_count)
-                VALUES ($hash, $name, $size, $count, $files, $magnet, $now, $now, 1)
+                INSERT INTO torrents (info_hash, name, total_size, file_count, files_json, magnet, first_seen_utc, last_seen_utc, seen_count, category)
+                VALUES ($hash, $name, $size, $count, $files, $magnet, $now, $now, 1, $category)
                 ON CONFLICT(info_hash) DO UPDATE SET
                     name = excluded.name,
                     total_size = excluded.total_size,
                     file_count = excluded.file_count,
                     files_json = excluded.files_json,
+                    category = excluded.category,
                     last_seen_utc = excluded.last_seen_utc,
                     seen_count = seen_count + 1;
                 """;
+            cmd.Parameters.AddWithValue("$category", category.ToString());
             cmd.Parameters.AddWithValue("$hash", hash);
             cmd.Parameters.AddWithValue("$name", name);
             cmd.Parameters.AddWithValue("$size", metadata.TotalSize);
@@ -158,6 +247,58 @@ public sealed class SearchIndex : IDisposable
         }
     }
 
+    /// <summary>Stores what trackers reported. Hashes that aren't indexed are ignored.</summary>
+    public void RecordScrape(IReadOnlyDictionary<string, ScrapeCounts> counts)
+    {
+        if (counts.Count == 0) return;
+        var nowIso = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
+
+        lock (_gate)
+        {
+            using var tx = _connection.BeginTransaction();
+            using var cmd = _connection.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = "UPDATE torrents SET seeders = $seeders, leechers = $leechers, scraped_utc = $now WHERE info_hash = $hash";
+            var seeders = cmd.Parameters.Add("$seeders", SqliteType.Integer);
+            var leechers = cmd.Parameters.Add("$leechers", SqliteType.Integer);
+            var hash = cmd.Parameters.Add("$hash", SqliteType.Text);
+            cmd.Parameters.AddWithValue("$now", nowIso);
+            foreach (var (infoHash, c) in counts)
+            {
+                seeders.Value = c.Seeders;
+                leechers.Value = c.Leechers;
+                hash.Value = infoHash.ToLowerInvariant();
+                cmd.ExecuteNonQuery();
+            }
+            tx.Commit();
+        }
+    }
+
+    /// <summary>
+    /// Up to <paramref name="limit"/> torrents whose tracker counts are missing or older than
+    /// <paramref name="maxAge"/>: never-checked ones first (newest first), then the stalest.
+    /// </summary>
+    public List<string> HashesNeedingScrape(int limit, TimeSpan maxAge)
+    {
+        var cutoff = (DateTime.UtcNow - maxAge).ToString("o", CultureInfo.InvariantCulture);
+        lock (_gate)
+        {
+            using var cmd = _connection.CreateCommand();
+            cmd.CommandText = """
+                SELECT info_hash FROM torrents
+                WHERE scraped_utc IS NULL OR scraped_utc < $cutoff
+                ORDER BY scraped_utc IS NOT NULL, scraped_utc, id DESC
+                LIMIT $limit
+                """;
+            cmd.Parameters.AddWithValue("$cutoff", cutoff);
+            cmd.Parameters.AddWithValue("$limit", limit);
+            using var reader = cmd.ExecuteReader();
+            var hashes = new List<string>();
+            while (reader.Read()) hashes.Add(reader.GetString(0));
+            return hashes;
+        }
+    }
+
     public SearchResult? Get(string infoHashHex)
     {
         lock (_gate) return GetUnlocked(infoHashHex.ToLowerInvariant());
@@ -188,37 +329,52 @@ public sealed class SearchIndex : IDisposable
         }
     }
 
-    public IReadOnlyList<SearchResult> Search(string query, int limit = 200)
+    /// <summary>
+    /// Matches names against <paramref name="query"/>, optionally restricted to one category or with
+    /// adult results left out. An empty query lists the most recently seen torrents.
+    /// </summary>
+    public IReadOnlyList<SearchResult> Search(
+        string query, int limit = 200, ContentCategory? category = null, bool excludeAdult = false)
     {
+        // Filter clauses are fixed text; the values are bound as parameters.
+        var filter = "";
+        if (category is not null) filter += " AND t.category = $category";
+        else if (excludeAdult) filter += " AND COALESCE(t.category, '') <> 'Adult'";
+
+        void Bind(SqliteCommand cmd)
+        {
+            cmd.Parameters.AddWithValue("$limit", limit);
+            if (category is not null) cmd.Parameters.AddWithValue("$category", category.Value.ToString());
+        }
+
         if (string.IsNullOrWhiteSpace(query))
-            return Query($"SELECT {SelectColumns} FROM torrents ORDER BY last_seen_utc DESC LIMIT $limit",
-                cmd => cmd.Parameters.AddWithValue("$limit", limit));
+            return Query($"SELECT {SelectColumns} FROM torrents t WHERE 1 = 1{filter} ORDER BY t.last_seen_utc DESC LIMIT $limit", Bind);
 
         if (_ftsAvailable)
         {
             var ftsQuery = BuildFtsQuery(query);
-            return Query("""
-                SELECT t.info_hash, t.name, t.total_size, t.file_count, t.first_seen_utc, t.last_seen_utc, t.seen_count, t.magnet
+            return Query($"""
+                SELECT {SelectColumns}
                 FROM torrents_fts f JOIN torrents t ON t.id = f.rowid
-                WHERE torrents_fts MATCH $query
-                ORDER BY t.seen_count DESC, t.last_seen_utc DESC
+                WHERE torrents_fts MATCH $query{filter}
+                ORDER BY {Ranking}
                 LIMIT $limit
                 """,
                 cmd =>
                 {
                     cmd.Parameters.AddWithValue("$query", ftsQuery);
-                    cmd.Parameters.AddWithValue("$limit", limit);
+                    Bind(cmd);
                 });
         }
 
         return Query($"""
             SELECT {SelectColumns}
-            FROM torrents WHERE name LIKE $pattern ESCAPE '\' ORDER BY seen_count DESC, last_seen_utc DESC LIMIT $limit
+            FROM torrents t WHERE t.name LIKE $pattern ESCAPE '\'{filter} ORDER BY {Ranking} LIMIT $limit
             """,
             cmd =>
             {
                 cmd.Parameters.AddWithValue("$pattern", $"%{EscapeLike(query.Trim())}%");
-                cmd.Parameters.AddWithValue("$limit", limit);
+                Bind(cmd);
             });
     }
 
@@ -236,7 +392,7 @@ public sealed class SearchIndex : IDisposable
     private SearchResult? GetUnlocked(string lowerHash)
     {
         using var cmd = _connection.CreateCommand();
-        cmd.CommandText = $"SELECT {SelectColumns} FROM torrents WHERE info_hash = $hash";
+        cmd.CommandText = $"SELECT {SelectColumns} FROM torrents t WHERE t.info_hash = $hash";
         cmd.Parameters.AddWithValue("$hash", lowerHash);
         using var reader = cmd.ExecuteReader();
         return reader.Read() ? ReadResult(reader) : null;
@@ -264,7 +420,10 @@ public sealed class SearchIndex : IDisposable
         ParseUtc(reader.GetString(4)),
         ParseUtc(reader.GetString(5)),
         reader.GetInt32(6),
-        reader.GetString(7));
+        reader.GetString(7),
+        !reader.IsDBNull(8) && Enum.TryParse<ContentCategory>(reader.GetString(8), out var category) ? category : ContentCategory.Other,
+        reader.IsDBNull(9) ? null : reader.GetInt32(9),
+        reader.IsDBNull(10) ? null : reader.GetInt32(10));
 
     private static DateTime ParseUtc(string iso) =>
         DateTime.Parse(iso, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind).ToUniversalTime();
